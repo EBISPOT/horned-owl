@@ -628,6 +628,10 @@ pub struct OntologyParser<
     // read in.
     keep_labels: bool,
     axiom_rank: HashMap<A, usize>,
+    // The owl:Annotation nodes, by label, ranked in the order their annotations
+    // are read: of several naming the same annotation of one source, the first
+    // annotates it.
+    annotation_rank: HashMap<A, usize>,
 
     // How far through the parse have we got?
     state: OntologyParserState,
@@ -663,6 +667,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             bnode_names: d!(),
             keep_labels: false,
             axiom_rank: d!(),
+            annotation_rank: d!(),
 
             triple,
             simple: d!(),
@@ -1329,10 +1334,12 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
         source: &Term<A>,
         anns: BTreeSet<Annotation<A>>,
     ) -> Result<BTreeSet<Annotation<A>>, HornedError> {
-        let Some(nodes) = self.annotation_nodes.remove(source) else {
+        let Some(mut nodes) = self.annotation_nodes.remove(source) else {
             return Ok(anns);
         };
+        nodes.sort_by_key(|(node, _)| self.annotation_rank.get(&node.0).copied().unwrap_or(usize::MAX));
         let mut anns: Vec<Annotation<A>> = anns.into_iter().collect();
+        let mut claimed = vec![false; anns.len()];
         let mut unread = vec![];
         for (node, v) in nodes {
             let [
@@ -1348,11 +1355,12 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             };
             let annotated = self.annotation(&[Term::BNode(node.clone()), p.clone(), ob.clone()])?;
             match anns.iter().position(|a| a.ap == annotated.ap && a.av == annotated.av) {
-                Some(i) => {
+                Some(i) if !claimed[i] => {
+                    claimed[i] = true;
                     let nested = self.annotations_of(&Term::BNode(node), nested)?;
                     anns[i].ann.extend(nested);
                 }
-                None => unread.push((node, v)),
+                _ => unread.push((node, v)),
             }
         }
         if !unread.is_empty() {
@@ -3505,11 +3513,23 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
 
             match built {
                 Some(rule) => {
-                    // Annotations attached directly to the Imp node (OWLAPI /
-                    // Protégé style), plus any reified (owl:Axiom) annotations
-                    // collected earlier — the form Horned-OWL's own RDF writer
-                    // produces. `ann_map` is Vec-valued, so drain every set.
-                    let mut ann = self.annotations_of(&Term::BNode(bnode.clone()), &ann_triples)?;
+                    // The annotations stated on the Imp node whose values are
+                    // literals annotate the rule, each bare. One whose value is
+                    // an IRI or an anonymous individual is an assertion about
+                    // the node, an anonymous individual, also bare. Reified
+                    // (owl:Axiom) annotations of the rule's type triple are the
+                    // rule's too. `ann_map` is Vec-valued, so drain every set.
+                    let (literals, resources): (Vec<_>, Vec<_>) =
+                        ann_triples.into_iter().partition(|t| matches!(t[2], Term::Literal(_)));
+                    let mut ann = self.parse_annotations(&literals)?;
+                    for t in &resources {
+                        let ann = self.annotation(t)?;
+                        let subject: AnonymousIndividual<A> = self.anon_for_bnode(&bnode);
+                        self.insert_distinct(AnnotatedComponent {
+                            component: AnnotationAssertion { subject: subject.into(), ann }.into(),
+                            ann: BTreeSet::new(),
+                        });
+                    }
                     let key = self.config.build.as_ref().substitute_term([
                         Term::BNode(bnode.clone()),
                         Term::RDF(VRDF::Type),
@@ -3683,9 +3703,16 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                 // Catch anything about the ontology and assume it is
                 // an annotation. Some versions of the OWL API do not
                 // declare annotation properties for ontology annotations
-                [s @ Term::Iri(iri), _, _] if self.ontology_nodes.contains(s) => {
+                [s @ Term::Iri(iri), _, o] if self.ontology_nodes.contains(s) => {
                     let ann = BTreeSet::from([self.annotation(t.triple())?]);
-                    for ann in self.annotate_annotations(&Term::Iri(iri.clone()), ann)? {
+                    // Only an annotation whose value is a literal carries the
+                    // annotations stated of it; one whose value is an IRI or an
+                    // anonymous individual is read bare.
+                    let ann = match o {
+                        Term::Literal(_) => self.annotate_annotations(&Term::Iri(iri.clone()), ann)?,
+                        _ => ann,
+                    };
+                    for ann in ann {
                         self.o.insert(OntologyAnnotation(ann));
                     }
                 }
@@ -3717,7 +3744,11 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                         continue;
                     }
                     let ann = BTreeSet::from([self.annotation(t)?]);
-                    for ann in self.annotate_annotations(&Term::BNode(k.clone()), ann)? {
+                    let ann = match &t[2] {
+                        Term::Literal(_) => self.annotate_annotations(&Term::BNode(k.clone()), ann)?,
+                        _ => ann,
+                    };
+                    for ann in ann {
                         self.o.insert(OntologyAnnotation(ann));
                     }
                 }
@@ -4155,21 +4186,35 @@ pub fn parser_with_build<
     OntologyParser::from_bufread(bufread, config)
 }
 
+/// What the reader that parsed a document knows of the order its statements
+/// are read in, beyond the order it made them.
+#[derive(Clone, Debug, Default)]
+pub struct StatementOrder {
+    /// The document's axiom nodes, by label, in the order their annotations
+    /// are read: an `owl:Annotation` node naming several of them as its source
+    /// annotates the first.
+    pub axiom_nodes: Vec<String>,
+    /// The document's `owl:Annotation` nodes, by label, in the order their
+    /// annotations are read: of several naming the same annotation of one
+    /// source, the first annotates it.
+    pub annotation_nodes: Vec<String>,
+    /// The statements, by position, whose literal the document types
+    /// `xsd:string`: a `Triple` holds that literal and the untyped one alike,
+    /// and an ontology sorts them apart.
+    pub typed_strings: std::collections::HashSet<usize>,
+}
+
 /// Read the statements of a document another reader has already parsed, in
-/// the order it made them.
+/// the order it made them, as `order` says they are read.
 ///
 /// Every blank node that is an anonymous individual is named by its own
-/// label. `axiom_nodes` are the document's axiom nodes, by label, in the order
-/// their annotations are read: an `owl:Annotation` node naming several of them
-/// as its source annotates the first. `typed_strings` are the statements, by
-/// position, whose literal the document types `xsd:string`: a `Triple` holds
-/// that literal and the untyped one alike, and an ontology sorts them apart.
+/// label.
 pub fn read_statements<A: ForIRI, AA: ForIndex<A>, B: AsRef<Build<A>>>(
     statements: impl IntoIterator<Item = Triple>,
     config: ParserConfiguration<A, B>,
-    axiom_nodes: &[String],
-    typed_strings: &std::collections::HashSet<usize>,
+    order: &StatementOrder,
 ) -> Result<(ConcreteRDFOntology<A, AA>, IncompleteParse<A>), HornedError> {
+    let typed_strings = &order.typed_strings;
     let build = config.build.as_ref();
     let triples = statements
         .into_iter()
@@ -4190,7 +4235,9 @@ pub fn read_statements<A: ForIRI, AA: ForIndex<A>, B: AsRef<Build<A>>>(
         .collect();
     let mut parser: OntologyParser<A, AA, ConcreteRDFOntology<A, AA>, B> = OntologyParser::new(triples, config);
     parser.keep_labels = true;
-    parser.axiom_rank = axiom_nodes.iter().enumerate().map(|(i, n)| (A::from(n.clone()), i)).collect();
+    parser.axiom_rank = order.axiom_nodes.iter().enumerate().map(|(i, n)| (A::from(n.clone()), i)).collect();
+    parser.annotation_rank =
+        order.annotation_nodes.iter().enumerate().map(|(i, n)| (A::from(n.clone()), i)).collect();
     parser.parse()
 }
 
@@ -4622,6 +4669,162 @@ mod test {
     }
 
     #[test]
+    fn an_ontology_annotation_with_a_resource_value_is_read_bare() {
+        // The annotations stated of an ontology annotation are its own when its
+        // value is a literal, and not read when its value is an IRI or an
+        // anonymous individual.
+        let annotation = |target: &str| {
+            format!(
+                r#"<owl:Annotation>
+        <owl:annotatedSource rdf:resource="http://example.com/x"/>
+        <owl:annotatedProperty rdf:resource="http://www.w3.org/2000/01/rdf-schema#seeAlso"/>
+        {target}
+        <rdfs:comment>nested</rdfs:comment>
+    </owl:Annotation>"#
+            )
+        };
+        let (ont, _) = read_owl1(&format!(
+            r#"<rdf:Description rdf:about="http://example.com/x">
+        <rdfs:seeAlso rdf:resource="http://example.com/x#elsewhere"/>
+        <rdfs:seeAlso rdf:nodeID="v"/>
+        <rdfs:seeAlso>text</rdfs:seeAlso>
+    </rdf:Description>
+    {}
+    {}
+    {}"#,
+            annotation(r#"<owl:annotatedTarget rdf:resource="http://example.com/x#elsewhere"/>"#),
+            annotation(r#"<owl:annotatedTarget rdf:nodeID="v"/>"#),
+            annotation("<owl:annotatedTarget>text</owl:annotatedTarget>"),
+        ));
+        let mut nested: Vec<(bool, usize)> = ont
+            .i()
+            .component_for_kind(ComponentKind::OntologyAnnotation)
+            .map(|ac| match &ac.component {
+                Component::OntologyAnnotation(OntologyAnnotation(a)) => {
+                    (matches!(a.av, AnnotationValue::Literal(_)), a.ann.len())
+                }
+                c => panic!("{c:?}"),
+            })
+            .collect();
+        nested.sort();
+        assert_eq!(nested, vec![(false, 0), (false, 0), (true, 1)]);
+    }
+
+    #[test]
+    fn a_rule_takes_its_literal_annotations_bare() {
+        // A literal annotation of the rule's node annotates the rule, without
+        // the annotations stated of it; one whose value is an anonymous
+        // individual is an assertion about the node.
+        let (ont, _) = read_owl1(
+            r#"<swrl:Variable rdf:about="urn:swrl:var#x" xmlns:swrl="http://www.w3.org/2003/11/swrl#"/>
+    <owl:Class rdf:about="http://example.com/x#A"/>
+    <owl:Class rdf:about="http://example.com/x#B"/>
+    <swrl:Imp rdf:nodeID="rule" xmlns:swrl="http://www.w3.org/2003/11/swrl#">
+        <swrl:body>
+            <swrl:AtomList>
+                <rdf:first>
+                    <swrl:ClassAtom>
+                        <swrl:classPredicate rdf:resource="http://example.com/x#A"/>
+                        <swrl:argument1 rdf:resource="urn:swrl:var#x"/>
+                    </swrl:ClassAtom>
+                </rdf:first>
+                <rdf:rest rdf:resource="http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"/>
+            </swrl:AtomList>
+        </swrl:body>
+        <swrl:head>
+            <swrl:AtomList>
+                <rdf:first>
+                    <swrl:ClassAtom>
+                        <swrl:classPredicate rdf:resource="http://example.com/x#B"/>
+                        <swrl:argument1 rdf:resource="urn:swrl:var#x"/>
+                    </swrl:ClassAtom>
+                </rdf:first>
+                <rdf:rest rdf:resource="http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"/>
+            </swrl:AtomList>
+        </swrl:head>
+        <rdfs:label>rule</rdfs:label>
+        <rdfs:seeAlso rdf:nodeID="v"/>
+    </swrl:Imp>
+    <owl:Annotation>
+        <owl:annotatedSource rdf:nodeID="rule"/>
+        <owl:annotatedProperty rdf:resource="http://www.w3.org/2000/01/rdf-schema#label"/>
+        <owl:annotatedTarget>rule</owl:annotatedTarget>
+        <rdfs:comment>nested</rdfs:comment>
+    </owl:Annotation>"#,
+        );
+        let rules: Vec<_> = ont.i().component_for_kind(ComponentKind::Rule).collect();
+        assert_eq!(rules.len(), 1, "{rules:#?}");
+        let anns: Vec<_> = rules[0].ann.iter().collect();
+        assert_eq!(anns.len(), 1, "{anns:#?}");
+        assert!(matches!(anns[0].av, AnnotationValue::Literal(_)) && anns[0].ann.is_empty(), "{anns:#?}");
+        let assertions: Vec<_> = ont.i().component_for_kind(ComponentKind::AnnotationAssertion).collect();
+        assert!(
+            matches!(
+                &assertions[..],
+                [ac] if matches!(&ac.component, Component::AnnotationAssertion(AnnotationAssertion {
+                    subject: AnnotationSubject::AnonymousIndividual(_),
+                    ann: Annotation { av: AnnotationValue::AnonymousIndividual(_), .. },
+                }))
+            ),
+            "{assertions:#?}"
+        );
+    }
+
+    #[test]
+    fn of_two_annotation_nodes_naming_one_annotation_the_first_read_annotates_it() {
+        // Two `owl:Annotation` nodes name the same annotation of an axiom; the
+        // one read first gives it its annotations, and the other's are not
+        // read. Which is first is the order the parse says.
+        use oxrdf::Literal as OxLiteral;
+        let nn = |s: &str| NamedNode::new_unchecked(s);
+        let bn = |s: &str| BlankNode::new_unchecked(s);
+        let owl = |l: &str| nn(&format!("http://www.w3.org/2002/07/owl#{l}"));
+        let rdf_type = nn("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let (comment, label) =
+            (nn("http://www.w3.org/2000/01/rdf-schema#comment"), nn("http://www.w3.org/2000/01/rdf-schema#label"));
+        let (a, c) = (nn("http://example.com/A"), nn("http://example.com/C"));
+        let sub = nn("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+        let mut statements = vec![
+            Triple::new(a.clone(), sub.clone(), c.clone()),
+            Triple::new(bn("ax"), rdf_type.clone(), owl("Axiom")),
+            Triple::new(bn("ax"), owl("annotatedSource"), a.clone()),
+            Triple::new(bn("ax"), owl("annotatedProperty"), sub.clone()),
+            Triple::new(bn("ax"), owl("annotatedTarget"), c.clone()),
+            Triple::new(bn("ax"), comment.clone(), OxLiteral::new_simple_literal("branch")),
+        ];
+        for (node, nested) in [("one", "first"), ("two", "second")] {
+            statements.extend([
+                Triple::new(bn(node), rdf_type.clone(), owl("Annotation")),
+                Triple::new(bn(node), owl("annotatedSource"), bn("ax")),
+                Triple::new(bn(node), owl("annotatedProperty"), comment.clone()),
+                Triple::new(bn(node), owl("annotatedTarget"), OxLiteral::new_simple_literal("branch")),
+                Triple::new(bn(node), label.clone(), OxLiteral::new_simple_literal(nested)),
+            ]);
+        }
+        for (first, expect) in [("one", "first"), ("two", "second")] {
+            let b = Build::new_rc();
+            let rest = if first == "one" { "two" } else { "one" };
+            let order = StatementOrder {
+                axiom_nodes: vec!["ax".into()],
+                annotation_nodes: vec![first.into(), rest.into()],
+                ..Default::default()
+            };
+            let (ont, _) = read_statements::<RcStr, RcAnnotatedComponent, _>(
+                statements.clone(),
+                ParserConfiguration::new(&b),
+                &order,
+            )
+            .unwrap();
+            let ont: ComponentMappedOntology<RcStr, RcAnnotatedComponent> = ont.into();
+            let subs: Vec<_> = ont.i().component_for_kind(ComponentKind::SubClassOf).collect();
+            let anns: Vec<_> = subs[0].ann.iter().collect();
+            assert_eq!(anns.len(), 1, "{anns:#?}");
+            let nested: Vec<_> = anns[0].ann.iter().map(|n| n.av.clone()).collect();
+            assert_eq!(nested, vec![AnnotationValue::Literal(Literal::Simple { literal: expect.into() })]);
+        }
+    }
+
+    #[test]
     fn a_chain_stated_twice_and_reified_once_is_one_annotated_axiom() {
         // Each statement of the chain is a list of its own, and the block
         // reifying it a third: one axiom, annotated.
@@ -4866,13 +5069,10 @@ mod test {
         ];
         let typed: std::collections::HashSet<usize> = [4, 6].into();
         let b = Build::new_rc();
-        let (ont, incomplete) = read_statements::<RcStr, RcAnnotatedComponent, _>(
-            statements,
-            ParserConfiguration::new(&b),
-            &[],
-            &typed,
-        )
-        .unwrap();
+        let order = StatementOrder { typed_strings: typed, ..Default::default() };
+        let (ont, incomplete) =
+            read_statements::<RcStr, RcAnnotatedComponent, _>(statements, ParserConfiguration::new(&b), &order)
+                .unwrap();
         assert!(incomplete.is_complete(), "{incomplete:?}");
         let ont: ComponentMappedOntology<RcStr, RcAnnotatedComponent> = ont.into();
         let mut labels: Vec<_> = ont.i().component_for_kind(ComponentKind::AnnotationAssertion).collect();
