@@ -161,14 +161,14 @@ pub fn write_full<A: ForIRI, AA: ForIndex<A>, W: Write>(
     {
         // The ontology is an unordered set, so `component_for_kind` yields imports
         // in IRI order. When the caller supplies the document's `import_order`,
-        // reorder to match it (ROBOT preserves the source order); otherwise keep
-        // the default order.
+        // reorder to match it; otherwise keep the default order. An import names
+        // its ontology by the full IRI, whatever prefix would abbreviate it.
         let mut imports: Vec<(String, String)> = ont
             .i()
             .component_for_kind(ComponentKind::Import)
             .filter_map(|c| match &c.component {
                 Component::Import(imp) => {
-                    Some((imp.0.as_ref().to_string(), c.as_functional_with_prefixes(mapping).to_string()))
+                    Some((imp.0.as_ref().to_string(), format!("Import(<{}>)", imp.0.as_ref())))
                 }
                 _ => None,
             })
@@ -1899,6 +1899,18 @@ mod test {
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use std::path::PathBuf;
+
+    #[test]
+    fn an_import_names_its_ontology_by_the_full_iri() {
+        use crate::model::MutableOntology;
+        let b = crate::model::Build::new_rc();
+        let mut o: ComponentMappedOntology<RcStr, AnnotatedComponent<RcStr>> = Default::default();
+        o.insert(crate::model::Import(b.iri("http://purl.obolibrary.org/obo/hp.owl")));
+        let mut mapping = PrefixMapping::default();
+        mapping.add_prefix("obo", "http://purl.obolibrary.org/obo/").unwrap();
+        let text = String::from_utf8(write(Vec::new(), &o, Some(&mapping)).unwrap()).unwrap();
+        assert!(text.contains("Import(<http://purl.obolibrary.org/obo/hp.owl>)\n"), "{text}");
+    }
 
     #[test]
     fn a_caller_names_the_entities_an_importing_ontology_declares() {
