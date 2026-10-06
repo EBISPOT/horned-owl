@@ -1520,23 +1520,24 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
 
         for (this_bnode, v) in std::mem::take(&mut self.bnode) {
             let dr: Result<_, HornedError> = match v.as_slice() {
+                // A connective's list may be empty, `rdf:nil`.
                 [
-                    [_, Term::OWL(VOWL::IntersectionOf), Term::BNode(bnodeid)], //: rustfmt hard line!
+                    [_, Term::OWL(VOWL::IntersectionOf), list @ (Term::BNode(_) | Term::RDF(VRDF::Nil) | Term::Iri(_))], //: rustfmt hard line!
                     [_, Term::RDF(VRDF::Type), Term::RDFS(VRDFS::Datatype)],
                 ] => {
                     ok_some! {
                         DataRange::DataIntersectionOf(
-                            self.retrieve_to_dr_seq(bnodeid)?
+                            self.retrieve_to_list(list, Self::retrieve_to_dr_seq)?
                         )
                     }
                 }
                 [
-                    [_, Term::OWL(VOWL::UnionOf), Term::BNode(bnodeid)], //: rustfmt hard line!
+                    [_, Term::OWL(VOWL::UnionOf), list @ (Term::BNode(_) | Term::RDF(VRDF::Nil) | Term::Iri(_))], //: rustfmt hard line!
                     [_, Term::RDF(VRDF::Type), Term::RDFS(VRDFS::Datatype)],
                 ] => {
                     ok_some! {
                         DataRange::DataUnionOf(
-                            self.retrieve_to_dr_seq(bnodeid)?
+                            self.retrieve_to_list(list, Self::retrieve_to_dr_seq)?
                         )
                     }
                 }
@@ -1551,12 +1552,12 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                     }
                 }
                 [
-                    [_, Term::OWL(VOWL::OneOf), Term::BNode(bnode)], //:
+                    [_, Term::OWL(VOWL::OneOf), list @ (Term::BNode(_) | Term::RDF(VRDF::Nil) | Term::Iri(_))], //:
                     [_, Term::RDF(VRDF::Type), Term::RDFS(VRDFS::Datatype)],
                 ] => {
                     ok_some! {
                         DataRange::DataOneOf(
-                            self.retrieve_to_literal_seq(bnode)?
+                            self.retrieve_to_list(list, Self::retrieve_to_literal_seq)?
                         )
                     }
                 }
@@ -2350,17 +2351,18 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                     [_, Term::OWL(VOWL::OnProperty), pr],
                     [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::Restriction)],
                 ] => Ok(self.retrieve_to_ope(pr).map(ClassExpression::ObjectHasSelf)),
+                // A connective's list may be empty, `rdf:nil`.
                 [
-                    [_, Term::OWL(VOWL::IntersectionOf), Term::BNode(bnodeid)], //:
+                    [_, Term::OWL(VOWL::IntersectionOf), list @ (Term::BNode(_) | Term::RDF(VRDF::Nil) | Term::Iri(_))], //:
                     [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::Class)],
                 ] => Ok(self
-                    .retrieve_to_ce_seq(bnodeid)
+                    .retrieve_to_list(list, Self::retrieve_to_ce_seq)
                     .map(ClassExpression::ObjectIntersectionOf)),
                 [
-                    [_, Term::OWL(VOWL::UnionOf), Term::BNode(bnodeid)], //:
+                    [_, Term::OWL(VOWL::UnionOf), list @ (Term::BNode(_) | Term::RDF(VRDF::Nil) | Term::Iri(_))], //:
                     [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::Class)],
                 ] => Ok(self
-                    .retrieve_to_ce_seq(bnodeid)
+                    .retrieve_to_list(list, Self::retrieve_to_ce_seq)
                     .map(ClassExpression::ObjectUnionOf)),
                 [
                     [_, Term::OWL(VOWL::ComplementOf), tce], //:
@@ -3103,32 +3105,20 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                 }
                 // Table 18: OWL 1 DL states `EquivalentClasses(C, CE)` for a named
                 // class `C` by attaching the connective or enumeration to `C`
-                // itself. An empty enumeration or union is owl:Nothing, an empty
-                // intersection owl:Thing, a one-member connective its member.
+                // itself. The connective holds the members its list names, however
+                // many: none, one or more.
                 [
                     x @ Term::Iri(_),
                     Term::OWL(op @ (VOWL::IntersectionOf | VOWL::UnionOf | VOWL::OneOf)),
                     seq @ (Term::BNode(_) | Term::RDF(VRDF::Nil) | Term::Iri(_)),
                 ] if self.distinguish_term_kind(x, ic) == Some(NamedOWLEntityKind::Class) => {
-                    let enumeration = matches!(op, VOWL::OneOf);
-                    let intersection = matches!(op, VOWL::IntersectionOf);
                     ok_some! {{
-                        let ce = if enumeration {
-                            let inds = self.retrieve_to_list(seq, Self::retrieve_to_ni_seq)?;
-                            if inds.is_empty() {
-                                self.config.build.as_ref().class(VOWL::Nothing).into()
-                            } else {
-                                ClassExpression::ObjectOneOf(inds)
+                        let ce = match op {
+                            VOWL::OneOf => ClassExpression::ObjectOneOf(self.retrieve_to_list(seq, Self::retrieve_to_ni_seq)?),
+                            VOWL::IntersectionOf => {
+                                ClassExpression::ObjectIntersectionOf(self.retrieve_to_list(seq, Self::retrieve_to_ce_seq)?)
                             }
-                        } else {
-                            let mut ces = self.retrieve_to_list(seq, Self::retrieve_to_ce_seq)?;
-                            match (ces.len(), intersection) {
-                                (0, true) => self.config.build.as_ref().class(VOWL::Thing).into(),
-                                (0, false) => self.config.build.as_ref().class(VOWL::Nothing).into(),
-                                (1, _) => ces.pop()?,
-                                (_, true) => ClassExpression::ObjectIntersectionOf(ces),
-                                (_, false) => ClassExpression::ObjectUnionOf(ces),
-                            }
+                            _ => ClassExpression::ObjectUnionOf(self.retrieve_to_list(seq, Self::retrieve_to_ce_seq)?),
                         };
                         EquivalentClasses(vec![self.retrieve_to_ce(x)?, ce]).into()
                     }}
@@ -4502,6 +4492,39 @@ mod test {
         assert!(ont.i().equivalent_class().any(|e| {
             matches!(e.0.as_slice(), [_, ClassExpression::ObjectOneOf(v)] if v.len() == 2)
         }));
+    }
+
+    #[test]
+    fn connectives_hold_the_members_their_lists_name() {
+        // An empty or one-member connective is that connective, a named
+        // class's (Table 18) or an anonymous one alike; an empty list is
+        // `rdf:nil`.
+        let (ont, incomplete) = read_owl1(
+            r#"<owl:Class rdf:about="http://example.com/x#B"/>
+    <owl:Class rdf:about="http://example.com/x#EmptyI"><owl:intersectionOf rdf:parseType="Collection"/></owl:Class>
+    <owl:Class rdf:about="http://example.com/x#EmptyO"><owl:oneOf rdf:parseType="Collection"/></owl:Class>
+    <owl:Class rdf:about="http://example.com/x#OneU">
+        <owl:unionOf rdf:parseType="Collection"><owl:Class rdf:about="http://example.com/x#B"/></owl:unionOf>
+    </owl:Class>
+    <owl:Class rdf:about="http://example.com/x#Sub">
+        <rdfs:subClassOf><owl:Class><owl:unionOf rdf:parseType="Collection"/></owl:Class></rdfs:subClassOf>
+    </owl:Class>
+    <owl:DatatypeProperty rdf:about="http://example.com/x#d">
+        <rdfs:range><rdfs:Datatype><owl:oneOf rdf:parseType="Collection"/></rdfs:Datatype></rdfs:range>
+    </owl:DatatypeProperty>
+    <owl:DatatypeProperty rdf:about="http://example.com/x#e">
+        <rdfs:range><rdfs:Datatype><owl:intersectionOf rdf:parseType="Collection"/></rdfs:Datatype></rdfs:range>
+    </owl:DatatypeProperty>"#,
+        );
+        assert!(incomplete.is_complete(), "{incomplete:?}");
+        let defines = |ce: &dyn Fn(&ClassExpression<RcStr>) -> bool| ont.i().equivalent_class().any(|e| e.0.iter().any(ce));
+        assert!(defines(&|ce| *ce == ClassExpression::ObjectIntersectionOf(vec![])));
+        assert!(defines(&|ce| *ce == ClassExpression::ObjectOneOf(vec![])));
+        assert!(defines(&|ce| matches!(ce, ClassExpression::ObjectUnionOf(v) if v.len() == 1)));
+        assert!(ont.i().sub_class_of().any(|sc| sc.sup == ClassExpression::ObjectUnionOf(vec![])));
+        let ranges: Vec<&DataRange<RcStr>> = ont.i().data_property_range().map(|r| &r.dr).collect();
+        assert!(ranges.contains(&&DataRange::DataOneOf(vec![])), "{ranges:?}");
+        assert!(ranges.contains(&&DataRange::DataIntersectionOf(vec![])), "{ranges:?}");
     }
 
     #[test]

@@ -964,6 +964,10 @@ impl<A: ForIRI> Display for Functional<'_, DataRange<A>, A> {
         use DataRange::*;
         match self.0 {
             Datatype(dt) => Functional(dt, self.1, None).fmt(f),
+            // As for classes, a single-operand intersection or union is just
+            // that operand.
+            DataIntersectionOf(dts) if dts.len() == 1 => Functional(&dts[0], self.1, None).fmt(f),
+            DataUnionOf(dts) if dts.len() == 1 => Functional(&dts[0], self.1, None).fmt(f),
             DataIntersectionOf(dts) => {
                 write!(f, "DataIntersectionOf({})", Functional(dts, self.1, None))
             }
@@ -1625,6 +1629,15 @@ mod tests {
                 Default::default(),
             );
         assert!(reparsed.is_ok(), "reparse failed: {reparsed:?}");
+
+        // So is a single-operand data intersection or union; an empty one
+        // keeps its keyword.
+        let integer = DataRange::Datatype(build.datatype("http://www.w3.org/2001/XMLSchema#integer"));
+        let union = DataRange::DataUnionOf(vec![integer.clone()]);
+        assert_eq!("<http://www.w3.org/2001/XMLSchema#integer>", format!("{}", union.as_functional()));
+        let intersection = DataRange::DataIntersectionOf(vec![integer]);
+        assert_eq!("<http://www.w3.org/2001/XMLSchema#integer>", format!("{}", intersection.as_functional()));
+        assert_eq!("DataUnionOf()", format!("{}", DataRange::<RcStr>::DataUnionOf(vec![]).as_functional()));
     }
 
     #[test]
