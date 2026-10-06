@@ -602,6 +602,9 @@ pub struct OntologyParser<
     // `owl:annotatedTarget`: copies of the axiom's own list, read once the
     // axiom takes the annotations keyed by their content.
     list_copies: Vec<BNode<A>>,
+    // The annotations a stated list took by its content, under that content's
+    // key: a list stated again with the same members states the same axiom.
+    claimed_lists: HashMap<[Term<A>; 3], Vec<BTreeSet<Annotation<A>>>>,
     // The base triples restored from reifications that name, as their
     // `owl:annotatedTarget`, a node of their own describing the class
     // expression the axiom states, and the unannotated axioms such a triple's
@@ -674,6 +677,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             annotation_nodes: d!(),
             inverse_nodes: d!(),
             list_copies: d!(),
+            claimed_lists: d!(),
             copied_targets: d!(),
             ontology_nodes: d!(),
             ontology_node: d!(),
@@ -1537,12 +1541,21 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
     /// The annotations recorded under the content of the list `id`, the
     /// object of `[subject, pred, id]`, moved onto that triple's key, where the
     /// axiom it states takes them; the reifications' copies of the list are
-    /// read with them.
+    /// read with them. A list the subject states again with the same members
+    /// states the same axiom, and takes the same annotations.
     fn claim_list_annotations(&mut self, subject: &Term<A>, pred: VOWL, id: &BNode<A>) {
         let Some(members) = self.bnode_seq.get(id) else { return };
         let canon = self.canon_list_term(members);
-        let Some(anns) = self.ann_map.remove(&[subject.clone(), Term::OWL(pred.clone()), canon.clone()]) else {
-            return;
+        let key = [subject.clone(), Term::OWL(pred.clone()), canon.clone()];
+        let anns = match self.ann_map.remove(&key) {
+            Some(anns) => {
+                self.claimed_lists.insert(key, anns.clone());
+                anns
+            }
+            None => match self.claimed_lists.get(&key) {
+                Some(anns) => anns.clone(),
+                None => return,
+            },
         };
         self.ann_map.entry([subject.clone(), Term::OWL(pred), Term::BNode(id.clone())]).or_default().extend(anns);
         let copies = std::mem::take(&mut self.list_copies);
@@ -4606,6 +4619,37 @@ mod test {
         )
         .unwrap();
         (ont.into(), incomplete)
+    }
+
+    #[test]
+    fn a_chain_stated_twice_and_reified_once_is_one_annotated_axiom() {
+        // Each statement of the chain is a list of its own, and the block
+        // reifying it a third: one axiom, annotated.
+        let chain = r#"<owl:propertyChainAxiom rdf:parseType="Collection">
+            <rdf:Description rdf:about="http://example.com/x#p"/>
+            <rdf:Description rdf:about="http://example.com/x#q"/>
+        </owl:propertyChainAxiom>"#;
+        let (ont, incomplete) = read_owl1(&format!(
+            r#"<owl:ObjectProperty rdf:about="http://example.com/x#p"/>
+    <owl:ObjectProperty rdf:about="http://example.com/x#q"/>
+    <owl:ObjectProperty rdf:about="http://example.com/x#r">
+        {chain}
+        {chain}
+    </owl:ObjectProperty>
+    <owl:Axiom>
+        <owl:annotatedSource rdf:resource="http://example.com/x#r"/>
+        <owl:annotatedProperty rdf:resource="http://www.w3.org/2002/07/owl#propertyChainAxiom"/>
+        <owl:annotatedTarget rdf:parseType="Collection">
+            <rdf:Description rdf:about="http://example.com/x#p"/>
+            <rdf:Description rdf:about="http://example.com/x#q"/>
+        </owl:annotatedTarget>
+        <rdfs:comment>c</rdfs:comment>
+    </owl:Axiom>"#
+        ));
+        assert!(incomplete.is_complete(), "{incomplete:?}");
+        let chains: Vec<_> = ont.i().component_for_kind(ComponentKind::SubObjectPropertyOf).collect();
+        assert_eq!(chains.len(), 1, "{chains:#?}");
+        assert_eq!(chains[0].ann.len(), 1, "{chains:#?}");
     }
 
     #[test]
