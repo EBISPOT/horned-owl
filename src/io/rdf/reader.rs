@@ -602,6 +602,12 @@ pub struct OntologyParser<
     // `owl:annotatedTarget`: copies of the axiom's own list, read once the
     // axiom takes the annotations keyed by their content.
     list_copies: Vec<BNode<A>>,
+    // The base triples restored from reifications that name, as their
+    // `owl:annotatedTarget`, a node of their own describing the class
+    // expression the axiom states, and the unannotated axioms such a triple's
+    // annotated axioms stand for, which go once the parse is done.
+    copied_targets: HashSet<[Term<A>; 3]>,
+    bare_twins: Vec<Component<A>>,
     atom: HashMap<Term<A>, Atom<A>>,
     variable: HashMap<IRI<A>, Variable<A>>,
 
@@ -663,6 +669,8 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             annotation_nodes: d!(),
             inverse_nodes: d!(),
             list_copies: d!(),
+            copied_targets: d!(),
+            bare_twins: d!(),
             atom: d!(),
             variable: d!(),
             state: OntologyParserState::New,
@@ -1297,6 +1305,15 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
     /// Only a triple between named things is restored: a blank-node subject or
     /// object belongs to a construct held elsewhere — a class expression, an RDF
     /// list — which the translation reaches by its own route.
+    ///
+    /// The exception is a reification whose `owl:annotatedTarget` is a node of
+    /// its own describing a class expression, where the axiom's triple names
+    /// another node describing the same one: an `owl:Axiom` block that spells
+    /// the axiom's class expression out again in place of naming its node. Its
+    /// triple is restored with that node as the object, so the axiom is read
+    /// from it with the block's annotations; and the unannotated axiom the
+    /// axiom's own triple states goes once the parse is done, so the axiom is
+    /// left annotated.
     fn restore_reified_triples(&mut self, reified: Vec<([Term<A>; 3], u64)>) {
         if reified.is_empty() {
             return;
@@ -1305,7 +1322,15 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             self.simple.iter().map(|t| t.triple().clone()).collect();
         let mut add: Vec<PosTriple<A>> = Vec::new();
         for (key, pos) in reified {
-            if matches!(key[0], Term::BNode(_)) || matches!(key[2], Term::BNode(_)) {
+            if matches!(key[0], Term::BNode(_)) {
+                continue;
+            }
+            if let Term::BNode(target) = &key[2] {
+                let construct = self.bnode.contains_key(target) && !self.bnode_seq.contains_key(target);
+                if construct && stated.insert(key.clone()) {
+                    self.copied_targets.insert(key.clone());
+                    add.push(PosTriple(key, pos));
+                }
                 continue;
             }
             if stated.insert(key.clone()) {
@@ -3076,9 +3101,13 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             match axiom? {
                 Some(axiom) => {
                     let axiom: Component<A> = axiom;
+                    let copied = self.copied_targets.contains(t.triple());
                     // Distinct reifications of the same base triple are distinct
                     // annotated axioms; insert each rather than merging.
                     for ann in self.take_anns(t.triple()) {
+                        if copied && !ann.is_empty() {
+                            self.bare_twins.push(axiom.clone());
+                        }
                         self.insert_distinct(AnnotatedComponent {
                             component: axiom.clone(),
                             ann,
@@ -3724,6 +3753,9 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
 
         if self.config.lax {
             phase!("simple_annotations(lax)", self.simple_annotations(true)?);
+        }
+        for component in std::mem::take(&mut self.bare_twins) {
+            self.o.remove(&AnnotatedComponent { component, ann: BTreeSet::new() });
         }
         self.state = OntologyParserState::Parse;
         Ok(())
