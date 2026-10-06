@@ -2062,6 +2062,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                 AnnotationProperty(a.clone()).into(),
                 AnnotationProperty(b.clone()).into(),
             ))),
+            (None, None) => Ok(None),
             _ => Err(HornedError::invalid(format!(
                 "Types of two properties do not match: {:?} and {:?}",
                 a, b
@@ -2126,8 +2127,10 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
         if !self.config.lax || matches!(pr, Term::BNode(_)) {
             return declared;
         }
+        // A property declared for annotations is read as the filler makes
+        // it, as one declared otherwise is.
         match declared {
-            Some(PropertyExpression::AnnotationProperty(_)) | None => declared,
+            None => declared,
             Some(_) => {
                 let iri = self.convert_to_iri(pr)?;
                 Some(if self.is_class_expression_lax(filler, ic) {
@@ -2154,7 +2157,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             return declared;
         }
         match declared {
-            Some(PropertyExpression::AnnotationProperty(_)) | None => declared,
+            None => declared,
             Some(_) => {
                 let iri = self.convert_to_iri(pr)?;
                 Some(if matches!(value, Term::Literal(_)) {
@@ -2956,12 +2959,15 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                         // does). Such a triple cannot be a property relation, so
                         // OWLAPI reads it as an annotation assertion. In lax mode do
                         // the same rather than failing the whole document.
-                        Ok(None) => match r {
-                            Term::Iri(sub) if self.config.lax => self
+                        Ok(None) => match (r, s) {
+                            (Term::Iri(sub), Term::Literal(_)) if self.config.lax => self
                                 .annotation(t.triple())
                                 .map(|ann| {
                                     Some(AnnotationAssertion { subject: sub.into(), ann }.into())
                                 }),
+                            // Two properties of no known kind relate nothing
+                            // the reader can state; the statement stays unread.
+                            _ if self.config.lax => Ok(None),
                             _ => Err(HornedError::invalid(
                                 "Cannot distinguish the types of {r} and {s}",
                             )),
@@ -2993,12 +2999,15 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                         // does). Such a triple cannot be a property relation, so
                         // OWLAPI reads it as an annotation assertion. In lax mode do
                         // the same rather than failing the whole document.
-                        Ok(None) => match r {
-                            Term::Iri(sub) if self.config.lax => self
+                        Ok(None) => match (r, s) {
+                            (Term::Iri(sub), Term::Literal(_)) if self.config.lax => self
                                 .annotation(t.triple())
                                 .map(|ann| {
                                     Some(AnnotationAssertion { subject: sub.into(), ann }.into())
                                 }),
+                            // Two properties of no known kind relate nothing
+                            // the reader can state; the statement stays unread.
+                            _ if self.config.lax => Ok(None),
                             _ => Err(HornedError::invalid(
                                 "Cannot distinguish the types of {r} and {s}",
                             )),
