@@ -1386,6 +1386,11 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
     /// from it with the block's annotations; and the unannotated axiom the
     /// axiom's own triple states goes once the parse is done, so the axiom is
     /// left annotated.
+    ///
+    /// A literal typed `xsd:string` and the untyped literal of its text are
+    /// one literal, so a block naming a stated triple with the literal typed
+    /// the other way names that triple, and the axiom takes the block's
+    /// literal.
     fn restore_reified_triples(&mut self, reified: Vec<([Term<A>; 3], u64)>) {
         if reified.is_empty() {
             return;
@@ -1393,6 +1398,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
         let mut stated: rustc_hash::FxHashSet<[Term<A>; 3]> =
             self.simple.iter().map(|t| t.triple().clone()).collect();
         let mut add: Vec<PosTriple<A>> = Vec::new();
+        let mut retyped: HashMap<[Term<A>; 3], Term<A>> = HashMap::default();
         for (key, pos) in reified {
             // A blank-node subject that describes an individual takes the
             // statement among its own; one that describes a construct, a class
@@ -1424,8 +1430,23 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                 }
                 continue;
             }
+            if !stated.contains(&key)
+                && let Some(other) = Self::other_string_typing(self.config.build.as_ref(), &key)
+                && stated.remove(&other)
+            {
+                retyped.insert(other, key[2].clone());
+                stated.insert(key);
+                continue;
+            }
             if stated.insert(key.clone()) {
                 add.push(PosTriple(key, pos));
+            }
+        }
+        if !retyped.is_empty() {
+            for t in &mut self.simple {
+                if let Some(o) = retyped.get(&t.0) {
+                    t.0[2] = o.clone();
+                }
             }
         }
         if add.is_empty() {
@@ -1455,12 +1476,36 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
         if self.bnode_seq.contains_key(&subject) || !Self::individual_statement(&triple) {
             return;
         }
+        let other = Self::other_string_typing(self.config.build.as_ref(), &triple);
         let group = self.bnode.entry(subject).or_insert_with(|| VPosTriple(vec![], pos));
         if group.0.contains(&triple) || !group.0.iter().all(Self::individual_statement) {
             return;
         }
-        group.0.push(triple);
+        // The statement with the literal typed the other way is this one, and
+        // takes the block's literal.
+        if let Some(i) = other.and_then(|other| group.0.iter().position(|t| *t == other)) {
+            group.0[i] = triple;
+        } else {
+            group.0.push(triple);
+        }
         group.0.sort();
+    }
+
+    /// `t` with its literal object typed `xsd:string` when it is untyped, and
+    /// untyped when it is typed so: the same literal, as a statement typing it
+    /// the other way states it.
+    fn other_string_typing(b: &Build<A>, t: &[Term<A>; 3]) -> Option<[Term<A>; 3]> {
+        const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+        let o = match &t[2] {
+            Term::Literal(Literal::Simple { literal }) => {
+                Literal::Datatype { literal: literal.clone(), datatype_iri: b.iri(XSD_STRING) }
+            }
+            Term::Literal(Literal::Datatype { literal, datatype_iri }) if datatype_iri.as_ref() == XSD_STRING => {
+                Literal::Simple { literal: literal.clone() }
+            }
+            _ => return None,
+        };
+        Some([t[0].clone(), t[1].clone(), Term::Literal(o)])
     }
 
     /// Whether the object of `t` is an individual: what `owl:sameAs` and
@@ -4103,15 +4148,32 @@ pub fn parser_with_build<
 /// Every blank node that is an anonymous individual is named by its own
 /// label. `axiom_nodes` are the document's axiom nodes, by label, in the order
 /// their annotations are read: an `owl:Annotation` node naming several of them
-/// as its source annotates the first.
+/// as its source annotates the first. `typed_strings` are the statements, by
+/// position, whose literal the document types `xsd:string`: a `Triple` holds
+/// that literal and the untyped one alike, and an ontology sorts them apart.
 pub fn read_statements<A: ForIRI, AA: ForIndex<A>, B: AsRef<Build<A>>>(
     statements: impl IntoIterator<Item = Triple>,
     config: ParserConfiguration<A, B>,
     axiom_nodes: &[String],
+    typed_strings: &std::collections::HashSet<usize>,
 ) -> Result<(ConcreteRDFOntology<A, AA>, IncompleteParse<A>), HornedError> {
+    let build = config.build.as_ref();
     let triples = statements
         .into_iter()
-        .map(|t| config.build.as_ref().convert_substitute_triple(t, 0))
+        .enumerate()
+        .map(|(i, t)| {
+            let PosTriple([s, p, o], pos) = build.convert_substitute_triple(t, 0);
+            let o = match o {
+                Term::Literal(Literal::Simple { literal }) if typed_strings.contains(&i) => {
+                    Term::Literal(Literal::Datatype {
+                        literal,
+                        datatype_iri: build.iri("http://www.w3.org/2001/XMLSchema#string"),
+                    })
+                }
+                o => o,
+            };
+            PosTriple([s, p, o], pos)
+        })
         .collect();
     let mut parser: OntologyParser<A, AA, ConcreteRDFOntology<A, AA>, B> = OntologyParser::new(triples, config);
     parser.keep_labels = true;
@@ -4736,6 +4798,56 @@ mod test {
         assert_eq!(ont.i().object_property_assertion().next().unwrap().from, typed);
         assert_eq!(ont.i().data_property_assertion().next().unwrap().from, typed);
         assert!(ont.i().same_individual().next().unwrap().0.contains(&typed));
+    }
+
+    #[test]
+    fn a_statement_typing_a_string_keeps_its_type_and_its_reification_compares_untyped() {
+        // The statement leaves the label untyped and the block naming it types
+        // it `xsd:string`: one literal, so one axiom, annotated, with the
+        // block's literal. A typed statement no block names stays typed.
+        use oxrdf::Literal as OxLiteral;
+        let nn = |s: &str| NamedNode::new_unchecked(s);
+        let ax = || BlankNode::new_unchecked("ax");
+        let (a, c) = (nn("http://example.com/A"), nn("http://example.com/C"));
+        let label = nn("http://www.w3.org/2000/01/rdf-schema#label");
+        let owl = |l: &str| nn(&format!("http://www.w3.org/2002/07/owl#{l}"));
+        let statements = vec![
+            Triple::new(a.clone(), label.clone(), OxLiteral::new_simple_literal("x")),
+            Triple::new(ax(), nn("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"), owl("Axiom")),
+            Triple::new(ax(), owl("annotatedSource"), a.clone()),
+            Triple::new(ax(), owl("annotatedProperty"), label.clone()),
+            Triple::new(ax(), owl("annotatedTarget"), OxLiteral::new_simple_literal("x")),
+            Triple::new(ax(), nn("http://www.w3.org/2000/01/rdf-schema#comment"), OxLiteral::new_simple_literal("c")),
+            Triple::new(c.clone(), label.clone(), OxLiteral::new_simple_literal("y")),
+        ];
+        let typed: std::collections::HashSet<usize> = [4, 6].into();
+        let b = Build::new_rc();
+        let (ont, incomplete) = read_statements::<RcStr, RcAnnotatedComponent, _>(
+            statements,
+            ParserConfiguration::new(&b),
+            &[],
+            &typed,
+        )
+        .unwrap();
+        assert!(incomplete.is_complete(), "{incomplete:?}");
+        let ont: ComponentMappedOntology<RcStr, RcAnnotatedComponent> = ont.into();
+        let mut labels: Vec<_> = ont.i().component_for_kind(ComponentKind::AnnotationAssertion).collect();
+        labels.sort();
+        let xsd_string = b.iri("http://www.w3.org/2001/XMLSchema#string");
+        let expect = |s: &str, l: &str| -> (IRI<RcStr>, Literal<RcStr>) {
+            (b.iri(s), Literal::Datatype { literal: l.into(), datatype_iri: xsd_string.clone() })
+        };
+        let got: Vec<_> = labels
+            .iter()
+            .map(|ac| match &ac.component {
+                Component::AnnotationAssertion(AnnotationAssertion {
+                    subject: AnnotationSubject::IRI(s),
+                    ann: Annotation { av: AnnotationValue::Literal(l), .. },
+                }) => ((s.clone(), l.clone()), ac.ann.len()),
+                c => panic!("{c:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![(expect("http://example.com/A", "x"), 1), (expect("http://example.com/C", "y"), 0)]);
     }
 
     #[test]
