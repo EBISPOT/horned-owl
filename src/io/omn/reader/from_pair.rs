@@ -169,16 +169,24 @@ impl<A: ForIRI> FromPair<A> for IRI<A> {
         match inner.as_rule() {
             Rule::AbbreviatedIRI => {
                 let span = inner.as_span();
-                // AbbreviatedIRI = { SPARQL_PnameLn }
+                // AbbreviatedIRI = { SPARQL_PnameLn | PrefixIRI }
                 // SPARQL_PnameLn = ${ SPARQL_PnameNs ~ SPARQL_PnLocal }
                 // SPARQL_PnameNs = ${ SPARQL_PnPrefix? ~ ":" }
-                let mut pname = inner.into_inner().next().unwrap().into_inner();
-                let prefix_part = pname.next().unwrap().into_inner().next();
-                let local = pname.next().unwrap();
-                let curie = Curie::new(
-                    Some(prefix_part.map(|p| p.as_str()).unwrap_or_default()),
-                    local.as_str(),
-                );
+                // PrefixIRI      = ${ !SectionKeyword ~ SPARQL_PnPrefix ~ ":" ~ … }
+                let name = inner.into_inner().next().unwrap();
+                let (prefix, local) = match name.as_rule() {
+                    Rule::PrefixIRI => (name.into_inner().next().unwrap().as_str(), ""),
+                    _ => {
+                        let mut pname = name.into_inner();
+                        let prefix_part = pname.next().unwrap().into_inner().next();
+                        let local = pname.next().unwrap();
+                        (
+                            prefix_part.map(|p| p.as_str()).unwrap_or_default(),
+                            local.as_str(),
+                        )
+                    }
+                };
+                let curie = Curie::new(Some(prefix), local);
                 match ctx.prefixes.expand_curie(&curie) {
                     Ok(s) => Ok(ctx.build.iri(s)),
                     Err(curie::ExpansionError::Invalid) => {
@@ -2338,6 +2346,76 @@ mod tests {
         assert_eq!(
             IRI::<RcStr>::from_pair(pfx, &ctx).unwrap(),
             b.iri("http://t/A")
+        );
+    }
+
+    /// A prefix name standing alone names the prefix's own IRI, wherever an IRI
+    /// may stand; a section keyword after it is still a keyword.
+    #[test]
+    fn reads_a_prefix_name_standing_alone() {
+        use crate::ontology::set::SetOntology;
+        use std::io::BufReader;
+
+        let doc = r#"Prefix: idsfor: <http://purl.obolibrary.org/obo/IAO_0000598>
+Prefix: allocatedto: <http://purl.obolibrary.org/obo/IAO_0000597>
+Prefix: idrange: <http://purl.obolibrary.org/obo/ro/idrange/>
+Prefix: xsd: <http://www.w3.org/2001/XMLSchema#>
+
+Ontology: <http://ex/idranges>
+
+Annotations:
+    idsfor: "SINK"
+
+AnnotationProperty: idsfor:
+
+AnnotationProperty: allocatedto:
+
+Datatype: idrange:1
+    Annotations:
+        allocatedto: "ONTOLOGY-CREATOR"
+    EquivalentTo:
+        xsd:integer[>= 0 , <= 999999]
+"#;
+        let b = Build::new_rc();
+        let (o, _): (SetOntology<RcStr>, PrefixMapping) = crate::io::omn::reader::read(
+            BufReader::new(doc.as_bytes()),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let components: std::collections::BTreeSet<_> =
+            o.iter().map(|ac| ac.component.clone()).collect();
+        let idsfor = b.annotation_property("http://purl.obolibrary.org/obo/IAO_0000598");
+        let allocatedto = b.annotation_property("http://purl.obolibrary.org/obo/IAO_0000597");
+        let range = b.datatype("http://purl.obolibrary.org/obo/ro/idrange/1");
+        assert!(components.contains(&Component::from(DeclareAnnotationProperty(idsfor.clone()))));
+        assert!(
+            components.contains(&Component::from(DeclareAnnotationProperty(
+                allocatedto.clone()
+            )))
+        );
+        assert!(
+            components.contains(&Component::from(OntologyAnnotation(Annotation {
+                ap: idsfor,
+                av: AnnotationValue::Literal(Literal::Simple {
+                    literal: "SINK".into()
+                }),
+                ann: BTreeSet::new(),
+            })))
+        );
+        assert!(components.contains(&Component::from(AnnotationAssertion {
+            subject: AnnotationSubject::IRI(range.0.clone()),
+            ann: Annotation {
+                ap: allocatedto,
+                av: AnnotationValue::Literal(Literal::Simple {
+                    literal: "ONTOLOGY-CREATOR".into()
+                }),
+                ann: BTreeSet::new(),
+            },
+        })));
+        assert!(
+            components
+                .iter()
+                .any(|c| matches!(c, Component::DatatypeDefinition(d) if d.kind == range))
         );
     }
 
