@@ -1302,9 +1302,13 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
     /// triples. Without this its 51,582 mappings reach the update as nothing but
     /// anonymous individuals and the component comes out empty.
     ///
-    /// Only a triple between named things is restored: a blank-node subject or
-    /// object belongs to a construct held elsewhere — a class expression, an RDF
-    /// list — which the translation reaches by its own route.
+    /// A triple about an anonymous individual is restored too: one whose
+    /// subject is a blank node describing nothing but an individual joins that
+    /// node's statements, and one whose object is a blank node that states
+    /// nothing of its own names the individual that node is. Any other
+    /// blank-node subject or object belongs to a construct held elsewhere — a
+    /// class expression, an RDF list — which the translation reaches by its own
+    /// route.
     ///
     /// The exception is a reification whose `owl:annotatedTarget` is a node of
     /// its own describing a class expression, where the axiom's triple names
@@ -1322,7 +1326,18 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             self.simple.iter().map(|t| t.triple().clone()).collect();
         let mut add: Vec<PosTriple<A>> = Vec::new();
         for (key, pos) in reified {
-            if matches!(key[0], Term::BNode(_)) {
+            if let Term::BNode(subject) = &key[0] {
+                self.restore_individual_statement(subject.clone(), key, pos);
+                continue;
+            }
+            if let Term::BNode(target) = &key[2]
+                && !self.bnode.contains_key(target)
+                && !self.bnode_seq.contains_key(target)
+                && Self::individual_object(&key)
+            {
+                if stated.insert(key.clone()) {
+                    add.push(PosTriple(key, pos));
+                }
                 continue;
             }
             if let Term::BNode(target) = &key[2] {
@@ -1354,6 +1369,48 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             self.simple.push(t);
         }
         self.simple.extend(it);
+    }
+
+    /// Put back `triple`, a reified statement about the blank node `subject`
+    /// that the document does not state, among that node's statements, when
+    /// it and they all describe an anonymous individual. A group that is
+    /// started here takes the position of the block that named the triple.
+    fn restore_individual_statement(&mut self, subject: BNode<A>, triple: [Term<A>; 3], pos: u64) {
+        if self.bnode_seq.contains_key(&subject) || !Self::individual_statement(&triple) {
+            return;
+        }
+        let group = self.bnode.entry(subject).or_insert_with(|| VPosTriple(vec![], pos));
+        if group.0.contains(&triple) || !group.0.iter().all(Self::individual_statement) {
+            return;
+        }
+        group.0.push(triple);
+        group.0.sort();
+    }
+
+    /// Whether the object of `t` is an individual: what `owl:sameAs` and
+    /// `owl:differentFrom` relate, or the value of a property or an annotation.
+    fn individual_object(t: &[Term<A>; 3]) -> bool {
+        match t {
+            [_, Term::OWL(VOWL::SameAs | VOWL::DifferentFrom), _] => true,
+            [_, Term::RDFS(rdfs), _] => rdfs.is_builtin(),
+            [_, Term::Iri(pred), _] => !is_reserved_iri(pred),
+            _ => false,
+        }
+    }
+
+    /// Whether `t` says something of an anonymous individual: types it, makes
+    /// it the same as or different from an individual, or relates it by a
+    /// property or an annotation.
+    fn individual_statement(t: &[Term<A>; 3]) -> bool {
+        match t {
+            [_, Term::RDF(VRDF::Type), Term::Iri(cls)] => !is_reserved_iri(cls),
+            [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::NamedIndividual | VOWL::Thing | VOWL::Nothing)] => true,
+            [_, Term::RDF(VRDF::Type), Term::BNode(_)] => true,
+            [_, Term::OWL(VOWL::SameAs | VOWL::DifferentFrom), _] => true,
+            [_, Term::RDFS(rdfs), _] => rdfs.is_builtin(),
+            [_, Term::Iri(pred), _] => !is_reserved_iri(pred),
+            _ => false,
+        }
     }
 
     /// The annotations recorded under the content of the list `id`, the
@@ -3595,14 +3652,18 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                     };
                     for triple in v.iter() {
                         if let [_, Term::RDF(VRDF::Type), Term::Iri(cls)] = triple {
-                            self.merge(AnnotatedComponent {
-                                component: ClassAssertion {
-                                    ce: Class(cls.clone()).into(),
-                                    i: ind.clone().into(),
+                            let component: Component<A> =
+                                ClassAssertion { ce: Class(cls.clone()).into(), i: ind.clone().into() }.into();
+                            // Each reification of the type is an annotated axiom
+                            // of its own.
+                            for ann in self.take_anns(triple) {
+                                let ac = AnnotatedComponent { component: component.clone(), ann };
+                                if ac.ann.is_empty() {
+                                    self.merge(ac);
+                                } else {
+                                    self.insert_distinct(ac);
                                 }
-                                .into(),
-                                ann: BTreeSet::new(),
-                            });
+                            }
                             continue;
                         }
                         let base = self.annotation(triple)?;
@@ -4499,6 +4560,52 @@ mod test {
         assert_eq!(ont.i().object_property_assertion().next().unwrap().from, typed);
         assert_eq!(ont.i().data_property_assertion().next().unwrap().from, typed);
         assert!(ont.i().same_individual().next().unwrap().0.contains(&typed));
+    }
+
+    #[test]
+    fn a_reified_statement_of_an_anonymous_individual_needs_no_stated_triple() {
+        // An `owl:Axiom` block means its axiom whether or not the document
+        // states the triple it names, an anonymous individual's included: a
+        // difference whose object is a node stating nothing, and a type of a
+        // node whose other statements describe the same individual.
+        let (ont, incomplete) = read_owl1(
+            r#"<owl:Class rdf:about="http://example.com/x#C"/>
+    <owl:NamedIndividual rdf:about="http://example.com/x#i"/>
+    <rdf:Description rdf:nodeID="t"/>
+    <rdf:Description rdf:nodeID="s">
+        <rdfs:label>s</rdfs:label>
+    </rdf:Description>
+    <owl:Axiom>
+        <owl:annotatedSource rdf:resource="http://example.com/x#i"/>
+        <owl:annotatedProperty rdf:resource="http://www.w3.org/2002/07/owl#differentFrom"/>
+        <owl:annotatedTarget rdf:nodeID="t"/>
+        <rdfs:comment>different</rdfs:comment>
+    </owl:Axiom>
+    <owl:Axiom>
+        <owl:annotatedSource rdf:nodeID="s"/>
+        <owl:annotatedProperty rdf:resource="http://www.w3.org/1999/02/22-rdf-syntax-ns#type"/>
+        <owl:annotatedTarget rdf:resource="http://example.com/x#C"/>
+        <rdfs:comment>typed</rdfs:comment>
+    </owl:Axiom>"#,
+        );
+        assert!(incomplete.is_complete(), "{incomplete:?}");
+        let anonymous = |i: &Individual<RcStr>| matches!(i, Individual::Anonymous(_));
+        let annotated: Vec<_> = ont.i().iter().filter(|ac| !ac.ann.is_empty()).collect();
+        assert_eq!(annotated.len(), 2, "{annotated:?}");
+        assert!(annotated.iter().any(|ac| matches!(&ac.component,
+            Component::DifferentIndividuals(d) if d.0.len() == 2 && d.0.iter().any(anonymous))));
+        let typed = annotated
+            .iter()
+            .find_map(|ac| match &ac.component {
+                Component::ClassAssertion(ca) => Some(ca.i.clone()),
+                _ => None,
+            })
+            .expect("the class assertion");
+        let Individual::Anonymous(typed) = typed else { panic!("{typed:?}") };
+        // The node's own statement stays its individual's.
+        let subject: AnnotationSubject<RcStr> = typed.into();
+        assert!(ont.i().iter().any(|ac| matches!(&ac.component,
+            Component::AnnotationAssertion(a) if a.subject == subject)));
     }
 
     #[test]
