@@ -609,6 +609,11 @@ pub struct OntologyParser<
     // anonymous individual each one turns out to name.
     bnode_order: HashMap<A, usize>,
     bnode_names: std::cell::RefCell<HashMap<A, AnonymousIndividual<A>>>,
+    // Whether an anonymous individual is named by its blank node's own label
+    // (see `read_statements`), and the order the axiom nodes' annotations are
+    // read in.
+    keep_labels: bool,
+    axiom_rank: HashMap<A, usize>,
 
     // How far through the parse have we got?
     state: OntologyParserState,
@@ -642,6 +647,8 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             config,
             bnode_order,
             bnode_names: d!(),
+            keep_labels: false,
+            axiom_rank: d!(),
 
             triple,
             simple: d!(),
@@ -678,9 +685,13 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             return i;
         }
         let b = self.config.build.as_ref();
-        let i = match b.next_bnode_label() {
-            Some(label) => b.anon(label),
-            None => b.anon_renumbered(),
+        let i = if self.keep_labels {
+            b.anon(bn.0.as_ref())
+        } else {
+            match b.next_bnode_label() {
+                Some(label) => b.anon(label),
+                None => b.anon_renumbered(),
+            }
         };
         self.bnode_names.borrow_mut().insert(bn.0.clone(), i.clone());
         i
@@ -1113,18 +1124,9 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
         // The owl:Annotation nodes first. Each annotates one annotation of the
         // source it names, and reading that source's annotations looks them up.
         for (k, v) in self.take_bnode_groups() {
-            match v.as_slice() {
-                [
-                    [_, Term::OWL(VOWL::AnnotatedProperty), _],
-                    [_, Term::OWL(VOWL::AnnotatedSource), source @ (Term::BNode(_) | Term::Iri(_))],
-                    [_, Term::OWL(VOWL::AnnotatedTarget), _],
-                    [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::Annotation)],
-                    ..,
-                ] => {
-                    let source = source.clone();
-                    self.annotation_nodes.entry(source).or_default().push((k, v));
-                }
-                _ => {
+            match self.annotation_node(v) {
+                Ok((source, v)) => self.annotation_nodes.entry(source).or_default().push((k, v)),
+                Err(v) => {
                     self.bnode.insert(k, v);
                 }
             }
@@ -1179,6 +1181,47 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
 
         self.restore_reified_triples(reified);
         Ok(())
+    }
+
+    /// An `owl:Annotation` node's source, with the node's statements naming
+    /// that source alone; or the statements back, when the node is not one.
+    ///
+    /// A node can name several sources: an annotation on an axiom written as
+    /// pairwise statements is reified once per statement, and the annotation's
+    /// own annotations are written once, naming every reification. Such a node
+    /// annotates the reification whose annotations are read first, in the
+    /// order `read_statements` was given, and no other.
+    fn annotation_node(&self, mut v: VPosTriple<A>) -> Result<(Term<A>, VPosTriple<A>), VPosTriple<A>> {
+        let sources: Vec<Term<A>> = v
+            .iter()
+            .filter_map(|t| match t {
+                [_, Term::OWL(VOWL::AnnotatedSource), s @ (Term::BNode(_) | Term::Iri(_))] => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if sources.len() > 1 {
+            let rank = |s: &Term<A>| match s {
+                Term::BNode(b) => self.axiom_rank.get(&b.0).copied(),
+                _ => None,
+            };
+            let Some(first) = sources.iter().filter(|s| rank(s).is_some()).min_by_key(|s| rank(s)).cloned() else {
+                return Err(v);
+            };
+            v.retain(|t| !matches!(t, [_, Term::OWL(VOWL::AnnotatedSource), s] if *s != first));
+        }
+        match v.as_slice() {
+            [
+                [_, Term::OWL(VOWL::AnnotatedProperty), _],
+                [_, Term::OWL(VOWL::AnnotatedSource), source @ (Term::BNode(_) | Term::Iri(_))],
+                [_, Term::OWL(VOWL::AnnotatedTarget), _],
+                [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::Annotation)],
+                ..,
+            ] => {
+                let source = source.clone();
+                Ok((source, v))
+            }
+            _ => Err(v),
+        }
     }
 
     /// The annotations `triples` state of `source`, each carrying the
@@ -3838,6 +3881,28 @@ pub fn parser_with_build<
     config: RDFParserConfiguration<A, B>,
 ) -> Result<OntologyParser<A, AA, O, B>, HornedError> {
     OntologyParser::from_bufread(bufread, config)
+}
+
+/// Read the statements of a document another reader has already parsed, in
+/// the order it made them.
+///
+/// Every blank node that is an anonymous individual is named by its own
+/// label. `axiom_nodes` are the document's axiom nodes, by label, in the order
+/// their annotations are read: an `owl:Annotation` node naming several of them
+/// as its source annotates the first.
+pub fn read_statements<A: ForIRI, AA: ForIndex<A>, B: AsRef<Build<A>>>(
+    statements: impl IntoIterator<Item = Triple>,
+    config: ParserConfiguration<A, B>,
+    axiom_nodes: &[String],
+) -> Result<(ConcreteRDFOntology<A, AA>, IncompleteParse<A>), HornedError> {
+    let triples = statements
+        .into_iter()
+        .map(|t| config.build.as_ref().convert_substitute_triple(t, 0))
+        .collect();
+    let mut parser: OntologyParser<A, AA, ConcreteRDFOntology<A, AA>, B> = OntologyParser::new(triples, config);
+    parser.keep_labels = true;
+    parser.axiom_rank = axiom_nodes.iter().enumerate().map(|(i, n)| (A::from(n.clone()), i)).collect();
+    parser.parse()
 }
 
 /// Read the whole of `bufread` into a `ConcreteRDFOntology`, along with
