@@ -279,9 +279,17 @@ impl<A: ForIRI> FromPair<A> for Literal<A> {
             }
             // §2.5 bare numeric literals: the lexical text IS the value; the
             // datatype is fixed by the production (integer/decimal/float).
-            Rule::IntegerLiteral => Ok(Literal::Datatype {
-                literal: inner.as_str().to_string(),
-                datatype_iri: ctx.build.iri("http://www.w3.org/2001/XMLSchema#integer"),
+            // An integer is its value as a 32-bit integer prints it (`+7` and
+            // `007` are `7`); one out of that range is a decimal, as written.
+            Rule::IntegerLiteral => Ok(match inner.as_str().parse::<i32>() {
+                Ok(i) => Literal::Datatype {
+                    literal: i.to_string(),
+                    datatype_iri: ctx.build.iri("http://www.w3.org/2001/XMLSchema#integer"),
+                },
+                Err(_) => Literal::Datatype {
+                    literal: inner.as_str().to_string(),
+                    datatype_iri: ctx.build.iri("http://www.w3.org/2001/XMLSchema#decimal"),
+                },
             }),
             Rule::DecimalLiteral => Ok(Literal::Datatype {
                 literal: inner.as_str().to_string(),
@@ -2423,6 +2431,47 @@ Datatype: idrange:1
     /// `Literal` is expected — e.g. a facet value `xsd:integer[>= 0]` or a
     /// `DataOneOf { 1, 2.5, 3.0f }`. Previously these hard-failed (the `Literal`
     /// rule only had the quoted/typed/lang forms).
+    /// A bare number in the range of a 32-bit integer is an integer, its value
+    /// printed; any other is a float when it ends in `f`, and a decimal,
+    /// written as it is, when it does not.
+    #[test]
+    fn reads_bare_numbers_by_their_form() {
+        let b = Build::new_rc();
+        let pm = curie::PrefixMapping::default();
+        let ctx = Context::new(&b, &pm);
+        let one_of = ManchesterLexer::lex(
+            Rule::DataRange,
+            "{ +7, 007, -0, 99999999999, 3e2, 1.5E-3, .5, 1., 1d, 1.5D, 1.f }",
+        )
+        .unwrap()
+        .next()
+        .unwrap();
+        let parsed = DataRange::<RcStr>::from_pair(one_of, &ctx).unwrap();
+        let DataRange::DataOneOf(lits) = parsed else {
+            panic!("expected DataOneOf, got {parsed:?}");
+        };
+        let typed = |literal: &str, datatype: &str| Literal::Datatype {
+            literal: literal.to_string(),
+            datatype_iri: b.iri(format!("http://www.w3.org/2001/XMLSchema#{datatype}")),
+        };
+        assert_eq!(
+            lits,
+            vec![
+                typed("7", "integer"),
+                typed("7", "integer"),
+                typed("0", "integer"),
+                typed("99999999999", "decimal"),
+                typed("3e2", "decimal"),
+                typed("1.5E-3", "decimal"),
+                typed(".5", "decimal"),
+                typed("1.", "decimal"),
+                typed("1d", "decimal"),
+                typed("1.5D", "decimal"),
+                typed("1.f", "float"),
+            ]
+        );
+    }
+
     #[test]
     fn reads_bare_numeric_literals() {
         let b = Build::new_rc();
