@@ -608,6 +608,11 @@ pub struct OntologyParser<
     // annotated axioms stand for, which go once the parse is done.
     copied_targets: HashSet<[Term<A>; 3]>,
     bare_twins: Vec<Component<A>>,
+    // The ontology's header nodes, named or blank: every subject typed
+    // `owl:Ontology` and every subject and object of `owl:imports`. What any
+    // of them states is the ontology's, and one of them names it.
+    ontology_nodes: HashSet<Term<A>>,
+    ontology_node: Option<Term<A>>,
     atom: HashMap<Term<A>, Atom<A>>,
     variable: HashMap<IRI<A>, Variable<A>>,
 
@@ -670,6 +675,8 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             inverse_nodes: d!(),
             list_copies: d!(),
             copied_targets: d!(),
+            ontology_nodes: d!(),
+            ontology_node: d!(),
             bare_twins: d!(),
             atom: d!(),
             variable: d!(),
@@ -882,48 +889,109 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
         }
     }
 
-    /// Process all import statements
+    /// Find the ontology's header nodes among the document's statements,
+    /// `triple`, in order, and the one the ontology is named by: the only one;
+    /// else the first the document states, unless a header names it as the
+    /// value of an annotation and it imports nothing; else the first that no
+    /// header names so.
+    fn find_ontology_nodes(&mut self, triple: &[PosTriple<A>]) {
+        let mut stated: Vec<&Term<A>> = vec![];
+        let mut importers: HashSet<&Term<A>> = HashSet::default();
+        for t in triple {
+            match t.triple() {
+                [s, Term::RDF(VRDF::Type), Term::OWL(VOWL::Ontology)] => stated.push(s),
+                [s, Term::OWL(VOWL::Imports), o] => {
+                    importers.insert(s);
+                    stated.push(s);
+                    stated.push(o);
+                }
+                _ => {}
+            }
+        }
+        self.ontology_nodes = stated.iter().map(|t| (*t).clone()).collect();
+        let named: HashSet<&Term<A>> = triple
+            .iter()
+            .filter_map(|t| match t.triple() {
+                [s, p, o @ Term::Iri(_)]
+                    if self.ontology_nodes.contains(s)
+                        && self.ontology_nodes.contains(o)
+                        && !importers.contains(o)
+                        && !matches!(p, Term::RDF(_) | Term::OWL(VOWL::Imports) | Term::OWL(VOWL::VersionIRI)) =>
+                {
+                    Some(o)
+                }
+                _ => None,
+            })
+            .collect();
+        self.ontology_node = match stated.first() {
+            Some(first) if self.ontology_nodes.len() == 1 || !named.contains(first) => Some((*first).clone()),
+            _ => stated.into_iter().find(|t| !named.contains(t)).cloned(),
+        };
+    }
+
+    /// Process all import statements: every `owl:imports`, whatever node it
+    /// is stated of.
     fn resolve_imports(&mut self) -> Vec<IRI<A>> {
         let mut v = vec![];
         for t in std::mem::take(&mut self.simple) {
             match t.0 {
-                [Term::Iri(_), Term::OWL(VOWL::Imports), Term::Iri(imp)] => {
-                    v.push(imp.clone());
-                    self.merge(AnnotatedComponent {
-                        component: Import(imp).into(),
-                        ann: BTreeSet::new(),
-                    });
-                }
+                [Term::Iri(_), Term::OWL(VOWL::Imports), Term::Iri(imp)] => v.push(imp.clone()),
                 _ => self.simple.push(t),
             }
+        }
+        let mut groups: Vec<&BNode<A>> = self.bnode.keys().collect();
+        groups.sort_by_key(|k| self.bnode_order.get(&k.0).copied().unwrap_or(usize::MAX));
+        let groups: Vec<BNode<A>> = groups.into_iter().cloned().collect();
+        for k in groups {
+            if let Some(group) = self.bnode.get_mut(&k) {
+                group.retain(|t| match t {
+                    [_, Term::OWL(VOWL::Imports), Term::Iri(imp)] => {
+                        v.push(imp.clone());
+                        false
+                    }
+                    _ => true,
+                });
+            }
+        }
+        for imp in v.clone() {
+            self.merge(AnnotatedComponent { component: Import(imp).into(), ann: BTreeSet::new() });
         }
 
         v
         // Section 3.1.2/table 4 of RDF Graphs
     }
 
-    /// Process the header statement
+    /// Process the header statements. Every `owl:versionIRI` is consumed, and
+    /// the one stated of the node the ontology is named by gives its version.
+    /// A blank node names no ontology: the ontology is then anonymous.
     fn headers(&mut self) {
         //Section 3.1.2/table 4
         //   *:x rdf:type owl:Ontology .
         //[ *:x owl:versionIRI *:y .]
-        let mut iri: Option<IRI<_>> = None;
-        let mut viri: Option<IRI<_>> = None;
-
+        let mut versions: HashMap<Term<A>, IRI<A>> = HashMap::default();
         for t in std::mem::take(&mut self.simple) {
             match t.triple() {
-                [Term::Iri(s), Term::RDF(VRDF::Type), Term::OWL(VOWL::Ontology)] => {
-                    iri = Some(s.clone());
-                }
-                [Term::Iri(s), Term::OWL(VOWL::VersionIRI), Term::Iri(ob)]
-                    if iri.as_ref() == Some(s) =>
-                {
-                    viri = Some(ob.clone());
+                [Term::Iri(_), Term::RDF(VRDF::Type), Term::OWL(VOWL::Ontology)] => {}
+                [s, Term::OWL(VOWL::VersionIRI), Term::Iri(ob)] => {
+                    versions.insert(s.clone(), ob.clone());
                 }
                 _ => self.simple.push(t),
             }
         }
-
+        for group in self.bnode.values_mut() {
+            group.retain(|t| match t {
+                [s, Term::OWL(VOWL::VersionIRI), Term::Iri(ob)] => {
+                    versions.insert(s.clone(), ob.clone());
+                    false
+                }
+                _ => true,
+            });
+        }
+        let iri = match &self.ontology_node {
+            Some(Term::Iri(iri)) => Some(iri.clone()),
+            _ => None,
+        };
+        let viri = iri.as_ref().and_then(|i| versions.get(&Term::Iri(i.clone())).cloned());
         self.o.insert(OntologyID { iri, viri });
     }
 
@@ -3523,7 +3591,6 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
     }
 
     fn simple_annotations(&mut self, parse_all: bool) -> Result<(), HornedError> {
-        let ont_id = <O as AsRef<SetIndex<A, AA>>>::as_ref(&self.o).the_ontology_id_or_default();
         for t in std::mem::take(&mut self.simple) {
             let firi =
                 |s: &mut OntologyParser<A, AA, O, B>, t, iri: &IRI<_>| -> Result<(), HornedError> {
@@ -3550,7 +3617,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                 // Catch anything about the ontology and assume it is
                 // an annotation. Some versions of the OWL API do not
                 // declare annotation properties for ontology annotations
-                [Term::Iri(iri), _, _] if ont_id.iri.as_ref() == Some(iri) => {
+                [s @ Term::Iri(iri), _, _] if self.ontology_nodes.contains(s) => {
                     let ann = BTreeSet::from([self.annotation(t.triple())?]);
                     for ann in self.annotate_annotations(&Term::Iri(iri.clone()), ann)? {
                         self.o.insert(OntologyAnnotation(ann));
@@ -3576,6 +3643,20 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
         // order the document mentions them, so the groups are visited that way
         // rather than in whatever order they were collected.
         for (k, v) in self.take_bnode_groups() {
+            // A blank header node: what it states besides its type annotates
+            // the ontology, as a named header's statements do.
+            if self.ontology_nodes.contains(&Term::BNode(k.clone())) {
+                for t in v.iter() {
+                    if matches!(t, [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::Ontology)]) {
+                        continue;
+                    }
+                    let ann = BTreeSet::from([self.annotation(t)?]);
+                    for ann in self.annotate_annotations(&Term::BNode(k.clone()), ann)? {
+                        self.o.insert(OntologyAnnotation(ann));
+                    }
+                }
+                continue;
+            }
             let fbnode =
                 |s: &mut OntologyParser<A, AA, O, B>, t, bn: &BNode<A>| -> Result<_, HornedError> {
                     let ind: AnonymousIndividual<A> = s.anon_for_bnode(bn);
@@ -3702,6 +3783,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                         _ => None,
                     })
                     .collect();
+                self.find_ontology_nodes(&triple);
                 step!("group_triples", Self::group_triples(triple, &mut self.simple, &mut self.bnode));
 
                 // Identical RDF triples denote the same triple (RDF is a set). A
@@ -4525,6 +4607,69 @@ mod test {
         let ranges: Vec<&DataRange<RcStr>> = ont.i().data_property_range().map(|r| &r.dr).collect();
         assert!(ranges.contains(&&DataRange::DataOneOf(vec![])), "{ranges:?}");
         assert!(ranges.contains(&&DataRange::DataIntersectionOf(vec![])), "{ranges:?}");
+    }
+
+    #[test]
+    fn every_ontology_header_annotates_and_imports() {
+        // Every node typed `owl:Ontology`, named or blank, states the
+        // ontology's annotations (with their own annotations) and imports.
+        // The first header the document states names the ontology, and when
+        // that one is a blank node the ontology is anonymous.
+        let doc = |first: &str, second: &str, reified: &str| {
+            format!(
+                r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+         xmlns:owl="http://www.w3.org/2002/07/owl#">
+    <owl:Ontology {first}>
+        <rdfs:comment>first</rdfs:comment>
+        <owl:imports rdf:resource="http://example.com/one"/>
+        <owl:versionIRI rdf:resource="http://example.com/v1"/>
+    </owl:Ontology>
+    <owl:Ontology {second}>
+        <rdfs:comment>second</rdfs:comment>
+        <owl:imports rdf:resource="http://example.com/two"/>
+        <owl:versionIRI rdf:resource="http://example.com/v2"/>
+    </owl:Ontology>
+    <owl:Annotation>
+        <owl:annotatedSource {reified}/>
+        <owl:annotatedProperty rdf:resource="http://www.w3.org/2000/01/rdf-schema#comment"/>
+        <owl:annotatedTarget>first</owl:annotatedTarget>
+        <rdfs:label>nested</rdfs:label>
+    </owl:Annotation>
+    <owl:Class rdf:about="http://example.com/x#A"/>
+</rdf:RDF>"#
+            )
+        };
+        for (first, second, iri, viri) in [
+            ("rdf:nodeID=\"o\"", "", None, None),
+            ("rdf:nodeID=\"o\"", "rdf:about=\"http://example.com/n2\"", None, None),
+            ("rdf:about=\"http://example.com/n1\"", "rdf:nodeID=\"o\"", Some("http://example.com/n1"), Some("http://example.com/v1")),
+            (
+                "rdf:about=\"http://example.com/n1\"",
+                "rdf:about=\"http://example.com/n2\"",
+                Some("http://example.com/n1"),
+                Some("http://example.com/v1"),
+            ),
+        ] {
+            let doc = doc(first, second, &first.replace("about", "resource"));
+            let (ont, incomplete) =
+                read::<RcStr, RcAnnotatedComponent, _, _>(&mut doc.as_bytes(), Default::default()).unwrap();
+            let ont: ComponentMappedOntology<RcStr, RcAnnotatedComponent> = ont.into();
+            let id = ont.i().ontology_id().next().cloned().unwrap_or_default();
+            assert_eq!(id.iri.as_ref().map(|i| i.as_ref()), iri, "{first} {second}");
+            assert_eq!(id.viri.as_ref().map(|i| i.as_ref()), viri, "{first} {second}");
+            let anns: Vec<_> = ont.i().ontology_annotation().collect();
+            assert_eq!(anns.len(), 2, "{first} {second}: {anns:?}");
+            // The annotation the reification names is itself annotated,
+            // whichever header it was stated of.
+            assert!(anns.iter().any(|a| a.0.ann.len() == 1), "{first} {second}: {anns:?}");
+            let imports: BTreeSet<_> = ont.i().import().map(|i| i.0.as_ref().to_string()).collect();
+            assert_eq!(imports, BTreeSet::from(["http://example.com/one".into(), "http://example.com/two".into()]));
+            // Nothing else: no header node read as an individual, nothing left over.
+            assert_eq!(ont.i().iter().count(), 6, "{first} {second}: {:#?}", ont.i().iter().collect::<Vec<_>>());
+            assert!(incomplete.is_complete(), "{first} {second}: {incomplete:?}");
+        }
     }
 
     #[test]
