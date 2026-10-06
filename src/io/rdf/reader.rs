@@ -1394,9 +1394,17 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             self.simple.iter().map(|t| t.triple().clone()).collect();
         let mut add: Vec<PosTriple<A>> = Vec::new();
         for (key, pos) in reified {
+            // A blank-node subject that describes an individual takes the
+            // statement among its own; one that describes a construct, a class
+            // expression, is the axiom's own node, and what it names is taken
+            // as for a named subject.
             if let Term::BNode(subject) = &key[0] {
-                self.restore_individual_statement(subject.clone(), key, pos);
-                continue;
+                let individual =
+                    self.bnode.get(subject).is_none_or(|group| group.0.iter().all(Self::individual_statement));
+                if individual || !matches!(&key[2], Term::BNode(_)) {
+                    self.restore_individual_statement(subject.clone(), key, pos);
+                    continue;
+                }
             }
             if let Term::BNode(target) = &key[2]
                 && !self.bnode.contains_key(target)
@@ -4728,6 +4736,51 @@ mod test {
         assert_eq!(ont.i().object_property_assertion().next().unwrap().from, typed);
         assert_eq!(ont.i().data_property_assertion().next().unwrap().from, typed);
         assert!(ont.i().same_individual().next().unwrap().0.contains(&typed));
+    }
+
+    #[test]
+    fn an_anonymous_equivalence_reified_with_a_copied_target_keeps_its_annotation() {
+        // The axiom's own node states the equivalence, inside the reification
+        // that names it, and the reification's target is a copy of the
+        // expression the node is equivalent to: one annotated axiom.
+        let doc = r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+         xmlns:owl="http://www.w3.org/2002/07/owl#">
+    <owl:Ontology rdf:about="http://example.com/e"/>
+    <owl:ObjectProperty rdf:about="http://example.com/e#p"/>
+    <owl:ObjectProperty rdf:about="http://example.com/e#q"/>
+    <owl:Class rdf:about="http://example.com/e#A"/>
+    <owl:Axiom>
+        <owl:annotatedSource>
+            <owl:Restriction>
+                <owl:onProperty rdf:resource="http://example.com/e#p"/>
+                <owl:someValuesFrom rdf:resource="http://example.com/e#A"/>
+                <owl:equivalentClass>
+                    <owl:Restriction>
+                        <owl:onProperty rdf:resource="http://example.com/e#q"/>
+                        <owl:someValuesFrom rdf:resource="http://example.com/e#A"/>
+                    </owl:Restriction>
+                </owl:equivalentClass>
+            </owl:Restriction>
+        </owl:annotatedSource>
+        <owl:annotatedProperty rdf:resource="http://www.w3.org/2002/07/owl#equivalentClass"/>
+        <owl:annotatedTarget>
+            <owl:Restriction>
+                <owl:onProperty rdf:resource="http://example.com/e#q"/>
+                <owl:someValuesFrom rdf:resource="http://example.com/e#A"/>
+            </owl:Restriction>
+        </owl:annotatedTarget>
+        <rdfs:comment>anonymous pair</rdfs:comment>
+    </owl:Axiom>
+</rdf:RDF>"#;
+        let (ont, incomplete) =
+            read::<RcStr, RcAnnotatedComponent, _, _>(&mut doc.as_bytes(), Default::default()).unwrap();
+        let ont: ComponentMappedOntology<RcStr, RcAnnotatedComponent> = ont.into();
+        let equivalences: Vec<_> = ont.i().component_for_kind(ComponentKind::EquivalentClasses).collect();
+        assert_eq!(equivalences.len(), 1, "{equivalences:#?}");
+        assert_eq!(equivalences[0].ann.len(), 1, "{equivalences:#?}");
+        assert!(incomplete.is_complete(), "{incomplete:?}");
     }
 
     #[test]
