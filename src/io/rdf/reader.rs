@@ -2490,6 +2490,38 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                         }
                     }
                 }
+                // An unqualified cardinality with a filler all the same, the
+                // shape OWL 1.1 documents wrote, is the qualified one.
+                [
+                    [_, Term::OWL(card @ (VOWL::Cardinality | VOWL::MaxCardinality | VOWL::MinCardinality)), literal], //:
+                    [_, Term::OWL(VOWL::OnClass), tce],              //:
+                    [_, Term::OWL(VOWL::OnProperty), Term::Iri(pr)], //:
+                    [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::Restriction)],
+                ] => ok_some! {{
+                    let n = self.convert_to_u32(literal)?;
+                    let ope: ObjectPropertyExpression<A> = pr.into();
+                    let bce: Box<ClassExpression<A>> = self.retrieve_to_ce(tce)?.into();
+                    match card {
+                        VOWL::Cardinality => ClassExpression::ObjectExactCardinality { n, ope, bce },
+                        VOWL::MaxCardinality => ClassExpression::ObjectMaxCardinality { n, ope, bce },
+                        _ => ClassExpression::ObjectMinCardinality { n, ope, bce },
+                    }
+                }},
+                [
+                    [_, Term::OWL(card @ (VOWL::Cardinality | VOWL::MaxCardinality | VOWL::MinCardinality)), literal], //:
+                    [_, Term::OWL(VOWL::OnDataRange), dr],           //:
+                    [_, Term::OWL(VOWL::OnProperty), Term::Iri(pr)], //:
+                    [_, Term::RDF(VRDF::Type), Term::OWL(VOWL::Restriction)],
+                ] => ok_some! {{
+                    let n = self.convert_to_u32(literal)?;
+                    let dp: DataProperty<A> = pr.into();
+                    let dr = self.retrieve_to_dr(dr)?;
+                    match card {
+                        VOWL::Cardinality => ClassExpression::DataExactCardinality { n, dp, dr },
+                        VOWL::MaxCardinality => ClassExpression::DataMaxCardinality { n, dp, dr },
+                        _ => ClassExpression::DataMinCardinality { n, dp, dr },
+                    }
+                }},
                 _a => Ok(None),
             };
 
