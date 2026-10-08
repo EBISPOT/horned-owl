@@ -540,8 +540,11 @@ fn render_vec_subject<
         }
         rest = Some(bn.clone())
     }
-    // Panic if Vec is zero length!
-    Ok(rest.unwrap())
+    // An empty list is rdf:nil.
+    Ok(match rest {
+        Some(r) => r,
+        None => ng.nn(RDF::Nil).into(),
+    })
 }
 
 // TODO This code is an almost exact duplicate of render_vec_slice. Why do I need both?
@@ -567,8 +570,11 @@ where
             }
             rest = Some(bn.clone().into())
         }
-        // Panic if Vec is zero length!
-        Ok(rest.unwrap())
+        // An empty list is rdf:nil.
+        Ok(match rest {
+            Some(r) => r,
+            None => ng.nn(RDF::Nil).into(),
+        })
     }
 }
 
@@ -2845,6 +2851,49 @@ Declaration(Class(:A))
         let amo: ComponentMappedOntology<RcStr, Rc<AnnotatedComponent<RcStr>>> = ont.clone().into();
         let mut rdf = Vec::new();
         write(&mut rdf, &amo, None).unwrap();
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ok(&mut rdf.as_slice()).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> = ont
+            .iter()
+            .filter(|c| !matches!(c.component, Component::OntologyID(_)) && !back.contains(*c))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "lost: {lost:#?}\n{}",
+            String::from_utf8_lossy(&rdf)
+        );
+    }
+
+    /// An empty list is `rdf:nil`: a class expression or data range with no
+    /// operands is written, and reads back as it was.
+    #[test]
+    fn an_empty_list_is_rdf_nil() {
+        let b = Build::new_rc();
+        let mut ont: ComponentMappedOntology<RcStr, Rc<AnnotatedComponent<RcStr>>> =
+            ComponentMappedOntology::new_rc();
+        ont.insert(OntologyID {
+            iri: Some(b.iri("http://example.org/t")),
+            viri: None,
+        });
+        ont.insert(DeclareClass(b.class("http://example.org/t#A")));
+        ont.insert(DeclareClass(b.class("http://example.org/t#B")));
+        ont.insert(DeclareDataProperty(
+            b.data_property("http://example.org/t#d"),
+        ));
+        ont.insert(SubClassOf {
+            sub: b.class("http://example.org/t#A").into(),
+            sup: ClassExpression::ObjectUnionOf(vec![]),
+        });
+        ont.insert(SubClassOf {
+            sub: b.class("http://example.org/t#B").into(),
+            sup: ClassExpression::ObjectIntersectionOf(vec![]),
+        });
+        ont.insert(DataPropertyRange {
+            dp: b.data_property("http://example.org/t#d"),
+            dr: DataRange::DataOneOf(vec![]),
+        });
+        let mut rdf = Vec::new();
+        write(&mut rdf, &ont, None).unwrap();
         let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
             read_ok(&mut rdf.as_slice()).into_iter().collect();
         let lost: Vec<&AnnotatedComponent<RcStr>> = ont
