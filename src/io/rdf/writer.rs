@@ -914,6 +914,8 @@ render! {
             );
             ng.keep_this_bn(ann_bn);
             self.ann.render(f, ng)?;
+            // The annotation after this one annotates what this one does.
+            ng.keep_this_bn(bn.clone());
         }
 
         Ok(triple!(f, bn, &self.ap.0, obj))
@@ -2211,12 +2213,12 @@ render! {
 /// has one) is already fixed by the time it's passed in here, so there's
 /// nothing left for a prefix to configure.
 ///
-/// `OntologyID`/`Import`/`OntologyAnnotation` need the ontology's own IRI
-/// as the subject of their triples, which isn't part of the component
-/// itself -- the first `OntologyID` seen supplies it for every `Import`/
-/// `OntologyAnnotation` that follows, so `components` must yield its
-/// `OntologyID` before any of those (the same ordering `write` already
-/// guarantees).
+/// `Import`/`OntologyAnnotation` are stated of the ontology's node, which
+/// isn't part of the component itself: its IRI, or a blank node when it has
+/// none. The `OntologyID` names it for every `Import`/`OntologyAnnotation`
+/// that follows; one that comes before any `OntologyID` is of an ontology
+/// with no IRI. So `components` must yield an ontology's `OntologyID` before
+/// any of those (the same ordering `write` already guarantees).
 pub fn write_stream<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W>, W: Write>(
     formatter: F,
     components: impl StreamOntology<A, AA>,
@@ -2234,7 +2236,7 @@ pub fn write_stream_with_config<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W
         lax: config.lax,
         ..NodeGenerator::default()
     };
-    let mut ontology_iri: Option<IRI<A>> = None;
+    let mut ontology: Option<PNamedOrBlankNode<A>> = None;
 
     for item in components {
         let ac = match item? {
@@ -2244,25 +2246,26 @@ pub fn write_stream_with_config<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W
         let ac: &AnnotatedComponent<A> = ac.borrow();
 
         match &ac.component {
-            Component::OntologyID(id) => {
-                if let Some(iri) = &id.iri {
+            Component::OntologyID(id) => match &id.iri {
+                Some(iri) => {
                     triples!(formatter, iri, ng.nn(RDF::Type), ng.nn(OWL::Ontology));
                     if let Some(viri) = &id.viri {
                         triples!(formatter, iri, ng.nn(OWL::VersionIRI), viri);
                     }
-                    ontology_iri = Some(iri.clone());
+                    ontology = Some(iri.into());
                 }
-            }
+                None => {
+                    stream_ontology_node(&mut formatter, &mut ng, &mut ontology)?;
+                }
+            },
             Component::Import(imp) => {
-                if let Some(iri) = &ontology_iri {
-                    triples!(formatter, iri, ng.nn(OWL::Imports), &imp.0);
-                }
+                let node = stream_ontology_node(&mut formatter, &mut ng, &mut ontology)?;
+                triples!(formatter, node, ng.nn(OWL::Imports), &imp.0);
             }
             Component::OntologyAnnotation(oa) => {
-                if let Some(iri) = &ontology_iri {
-                    ng.keep_this_bn(iri.into());
-                    oa.0.render(&mut formatter, &mut ng)?;
-                }
+                let node = stream_ontology_node(&mut formatter, &mut ng, &mut ontology)?;
+                ng.keep_this_bn(node);
+                oa.0.render(&mut formatter, &mut ng)?;
             }
             _ => {
                 ac.render(&mut formatter, &mut ng)?;
@@ -2271,6 +2274,27 @@ pub fn write_stream_with_config<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W
     }
 
     Ok(formatter.finish()?)
+}
+
+/// The node of the ontology a stream states: the one its `OntologyID` named,
+/// or, when none has, a blank node typed `owl:Ontology` here.
+fn stream_ontology_node<A: ForIRI, F: RdfFormatter<A, W>, W: Write>(
+    formatter: &mut F,
+    ng: &mut NodeGenerator<A>,
+    ontology: &mut Option<PNamedOrBlankNode<A>>,
+) -> Result<PNamedOrBlankNode<A>, HornedError> {
+    if let Some(node) = ontology {
+        return Ok(node.clone());
+    }
+    let node = ng.bn();
+    triples!(
+        formatter,
+        node.clone(),
+        ng.nn(RDF::Type),
+        ng.nn(OWL::Ontology)
+    );
+    *ontology = Some(node.clone());
+    Ok(node)
 }
 
 #[cfg(test)]
@@ -2495,6 +2519,48 @@ mod test {
         let ont_via_rdf = read_ntriples_ok(&mut &out[..]);
 
         assert_eq!(ont_direct, ont_via_rdf);
+    }
+
+    /// A stream's ontology with no IRI is a blank node, typed once, carrying
+    /// its imports and its annotations, whatever order they come in.
+    #[test]
+    fn write_stream_states_an_anonymous_ontology() {
+        let ofn = r#"Prefix(:=<http://example.org/t#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(
+Import(<http://example.org/other>)
+Annotation(Annotation(rdfs:comment "inner") rdfs:comment "a")
+Annotation(rdfs:label "b")
+Declaration(Class(:A))
+)"#;
+        let b = Build::new_rc();
+        let (ont, _): (SetOntology<RcStr>, _) = crate::io::ofn::reader::read(
+            &mut ofn.as_bytes(),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let items: Vec<crate::io::Result<StreamComponent<AnnotatedComponent<RcStr>>>> = ont
+            .iter()
+            .map(|ac| Ok(StreamComponent::Component(ac.clone())))
+            .collect();
+        let formatter = WriterQuadSerializerAdaptor::new(
+            RdfSerializer::from_format(oxrdfio::RdfFormat::NTriples).for_writer(Vec::new()),
+        );
+        let out = write_stream(formatter, items.into_iter()).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert_eq!(
+            text.matches("http://www.w3.org/2002/07/owl#Ontology>")
+                .count(),
+            1,
+            "{text}"
+        );
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ntriples_ok(&mut &out[..]).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> = ont
+            .iter()
+            .filter(|c| !matches!(c.component, Component::OntologyID(_)) && !back.contains(*c))
+            .collect();
+        assert!(lost.is_empty(), "lost: {lost:#?}\n{text}");
     }
 
     /// `Prefix` items in the stream are ignored (the formatter's namespace
@@ -2769,6 +2835,41 @@ Import(<http://example.org/other>)
 Annotation(Annotation(rdfs:comment "inner") rdfs:comment "a")
 Annotation(rdfs:label "b")
 Declaration(Class(:A))
+)"#;
+        let b = Build::new_rc();
+        let (ont, _): (SetOntology<RcStr>, _) = crate::io::ofn::reader::read(
+            &mut ofn.as_bytes(),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let amo: ComponentMappedOntology<RcStr, Rc<AnnotatedComponent<RcStr>>> = ont.clone().into();
+        let mut rdf = Vec::new();
+        write(&mut rdf, &amo, None).unwrap();
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ok(&mut rdf.as_slice()).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> = ont
+            .iter()
+            .filter(|c| !matches!(c.component, Component::OntologyID(_)) && !back.contains(*c))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "lost: {lost:#?}\n{}",
+            String::from_utf8_lossy(&rdf)
+        );
+    }
+
+    /// Each annotation is stated of what it annotates: after one with
+    /// annotations of its own, at any depth, the next is still of the axiom or
+    /// the annotation the two share. Written and read back, the axiom keeps
+    /// every annotation where it stood.
+    #[test]
+    fn an_annotation_after_a_nested_one_annotates_what_that_one_does() {
+        let ofn = r#"Prefix(:=<http://example.org/t#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(<http://example.org/t>
+Declaration(Class(:A))
+Declaration(Class(:C))
+SubClassOf(Annotation(Annotation(Annotation(rdfs:comment "m1") rdfs:comment "n1") Annotation(rdfs:label "n2") rdfs:comment "branch") Annotation(rdfs:label "plain") :A :C)
 )"#;
         let b = Build::new_rc();
         let (ont, _): (SetOntology<RcStr>, _) = crate::io::ofn::reader::read(
