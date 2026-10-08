@@ -586,24 +586,30 @@ impl<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W>, W: Write> Render<A, F, (
     for &ComponentMappedOntology<A, AA>
 {
     fn render(&self, f: &mut F, ng: &mut NodeGenerator<A>) -> Result<(), HornedError> {
+        // The ontology is its IRI, or a blank node when it has none; either way
+        // it carries its imports and its annotations.
         let ont_id = self.i().the_ontology_id_or_default();
-        if let Some(iri) = &ont_id.iri {
-            triples!(f, iri, ng.nn(RDF::Type), ng.nn(OWL::Ontology));
+        let ont_node: PNamedOrBlankNode<A> = match &ont_id.iri {
+            Some(iri) => iri.into(),
+            None => ng.bn(),
+        };
+        triples!(f, ont_node.clone(), ng.nn(RDF::Type), ng.nn(OWL::Ontology));
 
-            if let Some(viri) = &ont_id.viri {
-                triples!(f, iri, ng.nn(OWL::VersionIRI), viri);
-            }
+        if let (Some(iri), Some(viri)) = (&ont_id.iri, &ont_id.viri) {
+            triples!(f, iri, ng.nn(OWL::VersionIRI), viri);
+        }
 
-            let imp = self.i().import();
-            for i in imp {
-                triples!(f, iri, ng.nn(OWL::Imports), &i.0);
-            }
+        let imp = self.i().import();
+        for i in imp {
+            triples!(f, ont_node.clone(), ng.nn(OWL::Imports), &i.0);
+        }
 
-            let oa = self.i().ontology_annotation();
-            ng.keep_this_bn(iri.into());
-            for a in oa {
-                a.0.render(f, ng)?;
-            }
+        // Each annotation is of the ontology, whatever node the annotations of
+        // the one before it were stated of.
+        let oa = self.i().ontology_annotation();
+        for a in oa {
+            ng.keep_this_bn(ont_node.clone());
+            a.0.render(f, ng)?;
         }
 
         for cmp in self.i().iter() {
@@ -2682,7 +2688,7 @@ mod test {
         );
         // Should not panic; writes owl:AllDifferent with a single-element list (matching OWL-API behaviour)
         let out = write_to_rdf_formatter(&ont, formatter).unwrap();
-        assert!(!out.is_empty());
+        assert_ne!(out, strict_nt_of_an_empty_ontology());
     }
 
     #[test]
@@ -2703,7 +2709,21 @@ mod test {
             RDFWriterConfiguration { lax: false },
         )
         .unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out, strict_nt_of_an_empty_ontology());
+    }
+
+    /// What strict mode writes for an ontology with no IRI and no axioms: the
+    /// ontology's own node and nothing else.
+    fn strict_nt_of_an_empty_ontology() -> Vec<u8> {
+        let formatter = WriterQuadSerializerAdaptor::new(
+            RdfSerializer::from_format(oxrdfio::RdfFormat::NTriples).for_writer(Vec::new()),
+        );
+        write_to_rdf_formatter_with_config(
+            &ComponentMappedOntology::new_rc(),
+            formatter,
+            RDFWriterConfiguration { lax: false },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2722,7 +2742,7 @@ mod test {
             RdfSerializer::from_format(oxrdfio::RdfFormat::NTriples).for_writer(lax_sink),
         );
         let lax_out = write_to_rdf_formatter(&ont, lax_formatter).unwrap();
-        assert!(!lax_out.is_empty());
+        assert_ne!(lax_out, strict_nt_of_an_empty_ontology());
 
         let strict_sink = Vec::new();
         let strict_formatter = WriterQuadSerializerAdaptor::new(
@@ -2734,7 +2754,42 @@ mod test {
             RDFWriterConfiguration { lax: false },
         )
         .unwrap();
-        assert!(strict_out.is_empty());
+        assert_eq!(strict_out, strict_nt_of_an_empty_ontology());
+    }
+
+    /// An ontology with no IRI is a blank node carrying its imports and its
+    /// annotations, each stated of the ontology: written and read back, an
+    /// annotation with annotations of its own and the one after it both survive.
+    #[test]
+    fn an_anonymous_ontology_keeps_its_imports_and_annotations() {
+        let ofn = r#"Prefix(:=<http://example.org/t#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(
+Import(<http://example.org/other>)
+Annotation(Annotation(rdfs:comment "inner") rdfs:comment "a")
+Annotation(rdfs:label "b")
+Declaration(Class(:A))
+)"#;
+        let b = Build::new_rc();
+        let (ont, _): (SetOntology<RcStr>, _) = crate::io::ofn::reader::read(
+            &mut ofn.as_bytes(),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let amo: ComponentMappedOntology<RcStr, Rc<AnnotatedComponent<RcStr>>> = ont.clone().into();
+        let mut rdf = Vec::new();
+        write(&mut rdf, &amo, None).unwrap();
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ok(&mut rdf.as_slice()).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> = ont
+            .iter()
+            .filter(|c| !matches!(c.component, Component::OntologyID(_)) && !back.contains(*c))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "lost: {lost:#?}\n{}",
+            String::from_utf8_lossy(&rdf)
+        );
     }
 
     /// An annotated axiom stated by a node of its own carries its annotations
