@@ -198,7 +198,8 @@ pub fn write_full<A: ForIRI, AA: ForIndex<A>, W: Write>(
     writeln!(write)?;
 
     // --- Pass 1: declarations, entity ranks, and rdfs:labels ---
-    let mut declarations: Vec<(usize, String, String)> = Vec::new();
+    let mut declarations: Vec<(usize, String, String, Option<&std::collections::BTreeSet<crate::model::Annotation<A>>>)> =
+        Vec::new();
     let mut entity_rank: HashMap<String, usize> = HashMap::new();
     // Keyed by (rank, IRI), not IRI alone: OWLAPI declares per *entity*, so an IRI
     // legally punned as both a class and an annotation property needs a
@@ -240,6 +241,7 @@ pub fn write_full<A: ForIRI, AA: ForIndex<A>, W: Write>(
                 rank,
                 iri,
                 ac.as_functional_with_prefixes(mapping).to_string(),
+                Some(&ac.ann),
             ));
         } else if let Component::AnnotationAssertion(aa) = &ac.component {
             if let AnnotationSubject::IRI(subj) = &aa.subject {
@@ -323,7 +325,7 @@ pub fn write_full<A: ForIRI, AA: ForIndex<A>, W: Write>(
             None => format!("<{iri}>"),
         };
         let rendered = format!("Declaration({}({abbreviated}))", DECL_KEYWORD[rank]);
-        declarations.push((rank, iri, rendered));
+        declarations.push((rank, iri, rendered, None));
     }
 
     // The Declaration block is `sortOptionally(ontology.getSignature())`, i.e.
@@ -340,13 +342,16 @@ pub fn write_full<A: ForIRI, AA: ForIndex<A>, W: Write>(
     // OWLAPI orders entities by `IRI.compareTo` — NAMESPACE then remainder, not
     // the whole string. `…/obo/MF#manifestationOf` has namespace `…/obo/MF#`,
     // which sorts after the plain `…/obo/` shared by every `RO_…`/`GO_…`; a
-    // whole-string compare put it before them.
+    // whole-string compare put it before them. An entity's own declarations are
+    // in `compareTo` order too, which tells them apart by their annotations.
+    let none = std::collections::BTreeSet::new();
     declarations.sort_by(|a, b| {
         DECL_TYPE_INDEX[a.0]
             .cmp(&DECL_TYPE_INDEX[b.0])
             .then_with(|| owlapi_iri_cmp(&a.1, &b.1))
+            .then_with(|| owlapi_annotations_cmp(a.3.unwrap_or(&none), b.3.unwrap_or(&none)))
     });
-    for (_, _, rendered) in &declarations {
+    for (_, _, rendered, _) in &declarations {
         writeln!(write, "{rendered}")?;
     }
 
@@ -1368,6 +1373,7 @@ fn owlapi_general_cmp<A: ForIRI>(
     owlapi_axiom_index(&a.component)
         .cmp(&owlapi_axiom_index(&b.component))
         .then_with(|| owlapi_same_type_cmp(&a.component, &b.component))
+        .then_with(|| owlapi_annotations_cmp(&a.ann, &b.ann))
         .then_with(|| a.cmp(b))
 }
 
@@ -1378,7 +1384,8 @@ fn owlapi_general_cmp<A: ForIRI>(
 /// characteristic, domain or range its property first; a key its class, then its
 /// properties; and an n-ary axiom its operands as a set. A property chain is a
 /// list, compared element-wise, then by length, then by its super-property.
-/// Axioms differing only in their own annotations compare equal.
+/// Axioms differing only in their own annotations compare equal here; their
+/// annotations are compared after ([`owlapi_annotations_cmp`]).
 fn owlapi_same_type_cmp<A: ForIRI>(a: &Component<A>, b: &Component<A>) -> Ordering {
     use Component::*;
     use SubObjectPropertyExpression as SOPE;
@@ -1556,9 +1563,8 @@ fn owlapi_ann_assertion_cmp<A: ForIRI>(
     }
     let (Some(x), Some(y)) = (aa(a), aa(b)) else { return owlapi_axiom_cmp(a, b) };
     owlapi_ann_assertion_key_cmp(x, y)
-        // Deterministic tie-break where OWLAPI's comparator returns 0 (two
-        // assertions differing only in their own annotations); OWLAPI keeps the
-        // set's iteration order there, which is not reproducible.
+        .then_with(|| owlapi_annotations_cmp(&a.ann, &b.ann))
+        // Where OWLAPI finds two assertions equal, horned's derived order.
         .then_with(|| a.cmp(b))
 }
 
@@ -1680,18 +1686,67 @@ pub(super) fn owlapi_literal_cmp<A: ForIRI>(a: &Literal<A>, b: &Literal<A>) -> O
         .then_with(|| lang(a).cmp(lang(b)))
 }
 
+/// `OWLAnnotationImpl.compareObjectOfSameType`: the property, then the value.
+/// Values of different kinds compare by type index — an IRI (0) before an
+/// anonymous individual (1007) before a literal (4000+). An annotation's own
+/// annotations play no part.
+fn owlapi_annotation_cmp<A: ForIRI>(x: &crate::model::Annotation<A>, y: &crate::model::Annotation<A>) -> Ordering {
+    let vi = |v: &AnnotationValue<A>| match v {
+        AnnotationValue::IRI(_) => 0u32,
+        AnnotationValue::AnonymousIndividual(_) => 1007,
+        AnnotationValue::Literal(_) => 4000,
+    };
+    owlapi_iri_cmp(x.ap.0.as_ref(), y.ap.0.as_ref())
+        .then_with(|| vi(&x.av).cmp(&vi(&y.av)))
+        .then_with(|| match (&x.av, &y.av) {
+            (AnnotationValue::IRI(p), AnnotationValue::IRI(q)) => owlapi_iri_cmp(p.as_ref(), q.as_ref()),
+            (AnnotationValue::AnonymousIndividual(p), AnnotationValue::AnonymousIndividual(q)) => {
+                p.0.as_ref().cmp(q.0.as_ref())
+            }
+            (AnnotationValue::Literal(p), AnnotationValue::Literal(q)) => owlapi_literal_cmp(p, q),
+            _ => Ordering::Equal,
+        })
+}
+
+/// `OWLObject.compareTo` on two axioms the same in structure: their
+/// annotations, each set in its sorted order, element by element, and then the
+/// shorter first.
+fn owlapi_annotations_cmp<A: ForIRI>(
+    a: &std::collections::BTreeSet<crate::model::Annotation<A>>,
+    b: &std::collections::BTreeSet<crate::model::Annotation<A>>,
+) -> Ordering {
+    fn sorted<A: ForIRI>(
+        s: &std::collections::BTreeSet<crate::model::Annotation<A>>,
+    ) -> Vec<&crate::model::Annotation<A>> {
+        let mut v: Vec<&crate::model::Annotation<A>> = s.iter().collect();
+        v.sort_by(|p, q| owlapi_annotation_cmp(p, q));
+        v
+    }
+    let (x, y) = (sorted(a), sorted(b));
+    for (p, q) in x.iter().zip(&y) {
+        let o = owlapi_annotation_cmp(p, q);
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    x.len().cmp(&y.len())
+}
+
 /// OWLAPI's ordering for the axioms of one entity's frame: by axiom type, then
 /// [`owlapi_same_type_cmp`]. Class expressions compare on OWLAPI's type index,
 /// which is NOT horned-owl's variant order: `ObjectExactCardinality` precedes
 /// `ObjectMaxCardinality` there and follows it here, so PRO's `PR_000050469`,
 /// which carries one of each over the same property and filler, needs it.
 ///
-/// Where OWLAPI finds two axioms equal, a rule or class axiom keeps the order it
-/// arrived in and any other falls to horned's derived order.
+/// Two axioms the same in structure compare by their annotations
+/// ([`owlapi_annotations_cmp`]). Where OWLAPI finds two axioms equal, a rule or
+/// class axiom keeps the order it arrived in and any other falls to horned's
+/// derived order.
 fn owlapi_axiom_cmp<A: ForIRI>(a: &&AnnotatedComponent<A>, b: &&AnnotatedComponent<A>) -> std::cmp::Ordering {
     owlapi_axiom_index(&a.component)
         .cmp(&owlapi_axiom_index(&b.component))
         .then_with(|| owlapi_same_type_cmp(&a.component, &b.component))
+        .then_with(|| owlapi_annotations_cmp(&a.ann, &b.ann))
         .then_with(|| match &a.component {
             Component::Rule(_)
             | Component::SubClassOf(_)
