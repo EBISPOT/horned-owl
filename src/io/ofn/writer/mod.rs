@@ -496,11 +496,14 @@ pub fn write_full<A: ForIRI, AA: ForIndex<A>, W: Write>(
                 // the write can see (the document itself included), so when it
                 // names the entity it wins; the document-internal pick stands in
                 // only for entities the caller's map does not cover.
+                // A line feed in the label continues the comment on a line of
+                // its own.
                 let display = extra_labels
                     .and_then(|m| m.get(iri))
                     .or_else(|| labels.get(iri))
                     .cloned()
-                    .unwrap_or_else(|| short.clone());
+                    .unwrap_or_else(|| short.clone())
+                    .replace('\n', "\n# ");
                 writeln!(write, "# {label}: {short} ({display})")?;
                 writeln!(write)?;
 
@@ -2111,6 +2114,24 @@ AnnotationAssertion(rdfs:label :EX_0000050 \"part gear\"{datatype})
         };
         assert_eq!(banner(""), "# Class: :EX_0000050 (part gear)");
         assert_eq!(banner("^^xsd:string"), banner(""));
+    }
+
+    /// A line feed in a label continues the banner on a comment line of its
+    /// own; a carriage return is written as it is.
+    #[test]
+    fn a_label_with_line_breaks_stays_a_comment() {
+        let input = "Prefix(:=<http://purl.obolibrary.org/obo/>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(<http://example.org/o>
+Declaration(Class(:EX_0000050))
+AnnotationAssertion(rdfs:label :EX_0000050 \"one\ntwo\rthree\")
+)";
+        let (ont, prefixes): (ComponentMappedOntology<RcStr, AnnotatedComponent<RcStr>>, _) =
+            crate::io::ofn::reader::read(&mut input.as_bytes(), Default::default()).unwrap();
+        let mut writer = Vec::new();
+        crate::io::ofn::writer::write(&mut writer, &ont, Some(&prefixes)).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("# Class: :EX_0000050 (one\n# two\rthree)\n"), "{output}");
     }
 
     #[cfg(test)]
