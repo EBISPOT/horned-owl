@@ -1970,6 +1970,25 @@ mod test {
         assert!(text.contains("Import(<http://purl.obolibrary.org/obo/hp.owl>)\n"), "{text}");
     }
 
+    /// A disjoint union of one class, or of none, is written in its class's
+    /// frame like any other.
+    #[test]
+    fn a_disjoint_union_of_one_class_or_none_is_written() {
+        use crate::model::MutableOntology;
+        let b = crate::model::Build::new_rc();
+        let mut o: ComponentMappedOntology<RcStr, AnnotatedComponent<RcStr>> = Default::default();
+        o.insert(crate::model::DisjointUnion(b.class("http://example.org/r#U"), vec![]));
+        o.insert(crate::model::DisjointUnion(
+            b.class("http://example.org/r#V"),
+            vec![b.class("http://example.org/r#B").into()],
+        ));
+        let mut mapping = PrefixMapping::default();
+        mapping.add_prefix("", "http://example.org/r#").unwrap();
+        let text = String::from_utf8(write(Vec::new(), &o, Some(&mapping)).unwrap()).unwrap();
+        assert!(text.contains("# Class: :U (:U)\n\nDisjointUnion(:U )\n"), "{text}");
+        assert!(text.contains("# Class: :V (:V)\n\nDisjointUnion(:V :B)\n"), "{text}");
+    }
+
     #[test]
     fn a_caller_names_the_entities_an_importing_ontology_declares() {
         // An ontology that imports declares nothing of its own accord, and
