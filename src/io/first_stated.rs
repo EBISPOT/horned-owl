@@ -24,9 +24,9 @@ use crate::visitor::mutable::{VisitMut, WalkMut};
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 /// `O`, whose `insert` keeps the first of any two components that are equal
-/// once every `xsd:string` literal is read as untyped, and the first of any two
-/// ontology annotations with one property and one value, or the ontology
-/// annotations a hold function chooses of all those inserted.
+/// once every `xsd:string` literal is read as untyped, and of the ontology
+/// annotations inserted those [`first_of_each`] holds, or those a hold
+/// function chooses.
 pub(crate) struct FirstStated<A: ForIRI, O> {
     ont: O,
     /// Which ontology annotations the ontology holds, of every one inserted;
@@ -36,10 +36,41 @@ pub(crate) struct FirstStated<A: ForIRI, O> {
     /// The untyped form of every component inserted with an `xsd:string`
     /// literal in it.
     typed: HashSet<AnnotatedComponent<A>>,
-    /// The untyped form of every ontology annotation inserted, held or not.
-    annotations: HashSet<AnnotatedComponent<A>>,
-    /// The property and value of every ontology annotation held.
+    /// The ontology annotations inserted, without a hold function.
+    first: FirstOfEach<A>,
+}
+
+/// Of the annotations an ontology is given of itself, in order, those it holds
+/// when nothing else chooses: each but one equal to an annotation given before,
+/// once every `xsd:string` literal is read as untyped, and one with the
+/// property and the value of an annotation held, whatever annotations each
+/// carries of its own.
+pub(crate) fn first_of_each<A: ForIRI>(added: Vec<Annotation<A>>) -> Vec<Annotation<A>> {
+    let mut first = FirstOfEach::default();
+    added.into_iter().filter(|a| first.holds(a)).collect()
+}
+
+/// The annotations an ontology was given of itself, for [`first_of_each`].
+struct FirstOfEach<A: ForIRI> {
+    /// The untyped form of every one given, held or not.
+    given: HashSet<AnnotatedComponent<A>>,
+    /// The property and the value of every one held.
     held: HashSet<(AnnotationProperty<A>, AnnotationValue<A>)>,
+}
+
+impl<A: ForIRI> Default for FirstOfEach<A> {
+    fn default() -> Self {
+        FirstOfEach { given: HashSet::new(), held: HashSet::new() }
+    }
+}
+
+impl<A: ForIRI> FirstOfEach<A> {
+    /// Whether `a`, given after those given before, is held.
+    fn holds(&mut self, a: &Annotation<A>) -> bool {
+        let ac: AnnotatedComponent<A> = OntologyAnnotation(a.clone()).into();
+        let untyped = untyped_strings(&ac).unwrap_or(ac);
+        self.given.insert(untyped) && self.held.insert((a.ap.clone(), a.av.clone()))
+    }
 }
 
 impl<A: ForIRI, O: Default> Default for FirstStated<A, O> {
@@ -56,8 +87,7 @@ impl<A: ForIRI, O: Default> FirstStated<A, O> {
             hold,
             added: Vec::new(),
             typed: HashSet::new(),
-            annotations: HashSet::new(),
-            held: HashSet::new(),
+            first: FirstOfEach::default(),
         }
     }
 }
@@ -105,11 +135,7 @@ impl<A: ForIRI, O: MutableOntology<A>> MutableOntology<A> for FirstStated<A, O> 
                 self.added.push(a.clone());
                 return true;
             }
-            let untyped = untyped_strings(&ac).unwrap_or_else(|| ac.clone());
-            if !self.annotations.insert(untyped) || !self.held.insert((a.ap.clone(), a.av.clone())) {
-                return false;
-            }
-            return self.ont.insert(ac);
+            return self.first.holds(a) && self.ont.insert(ac);
         }
         match untyped_strings(&ac) {
             None => {
