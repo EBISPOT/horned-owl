@@ -32,6 +32,7 @@ mod as_functional;
 pub use self::as_functional::set_write_xsd_string;
 pub use self::as_functional::AsFunctional;
 pub use self::as_functional::Functional;
+pub use self::as_functional::Style;
 use self::as_functional::percent_encode_iri;
 
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
