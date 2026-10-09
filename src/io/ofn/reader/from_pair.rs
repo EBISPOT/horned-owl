@@ -963,7 +963,8 @@ impl<A: ForIRI, O: MutableOntology<A> + Ontology<A> + Default> FromPair<A>
 
         // Of two annotations or axioms that differ only in typing a string
         // `xsd:string`, the ontology holds the first.
-        let mut ontology: crate::io::first_stated::FirstStated<A, O> = Default::default();
+        let mut ontology: crate::io::first_stated::FirstStated<A, O> =
+            crate::io::first_stated::FirstStated::new(ctx.hold_ontology_annotations);
         let mut ontology_id = OntologyID::default();
 
         // Parse ontology IRI and Version IRI if any
@@ -1051,7 +1052,10 @@ where
     fn from_pair_unchecked(pair: Pair<Rule>, ctx: &Context<'_, A>) -> Result<Self> {
         let mut pairs = pair.into_inner();
         let prefixes = PrefixMapping::from_pair(pairs.next().unwrap(), ctx)?;
-        let context = Context::new(ctx.build, &prefixes);
+        let context = Context {
+            hold_ontology_annotations: ctx.hold_ontology_annotations,
+            ..Context::new(ctx.build, &prefixes)
+        };
         MutableOntologyWrapper::from_pair(pairs.next().unwrap(), &context)
             .map(|ont| (ont, prefixes))
     }

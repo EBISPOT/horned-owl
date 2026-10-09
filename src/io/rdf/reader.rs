@@ -618,6 +618,9 @@ pub struct OntologyParser<
     // The owl:Axiom blocks reifying a statement about a named ontology: the
     // statement as each states it, and the block's node.
     header_blocks: Vec<([Term<A>; 3], BNode<A>)>,
+    // The annotations of the ontology, in the order they are read; the
+    // ontology takes those its configuration holds once the parse is done.
+    ontology_annotations: Vec<Annotation<A>>,
     bare_twins: Vec<Component<A>>,
     // The ontology's header nodes, named or blank: every subject typed
     // `owl:Ontology` and every subject and object of `owl:imports`. What any
@@ -694,6 +697,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
             copied_targets: d!(),
             restored_header: d!(),
             header_blocks: d!(),
+            ontology_annotations: d!(),
             ontology_nodes: d!(),
             ontology_node: d!(),
             bare_twins: d!(),
@@ -3769,6 +3773,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                 // declare annotation properties for ontology annotations
                 [s @ Term::Iri(iri), _, o] if self.ontology_nodes.contains(s) => {
                     let ann = BTreeSet::from([self.annotation(t.triple())?]);
+                    let mut bare = None;
                     // Only an annotation the document states, whose value is a
                     // literal, carries the annotations stated of it; one whose
                     // value is an IRI or an anonymous individual is read bare,
@@ -3779,26 +3784,27 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                             // Each block reifying the statement states it again
                             // bare, and the first of them, in the order the
                             // blocks are read, is the one kept. It stays a
-                            // second annotation when the statement's carries
+                            // second annotation, given to the ontology after
+                            // the statement's, when the statement's carries
                             // annotations, its literal is untyped and the block
                             // types that literal `xsd:string`: the ontology
-                            // holds an untyped literal as the typed one, and
-                            // the typed one apart from the untyped one.
+                            // holds the typed literal apart from the untyped
+                            // one given before it.
                             if ann.iter().any(|a| !a.ann.is_empty())
                                 && matches!(o, Term::Literal(Literal::Simple { .. }))
                                 && let Some(key) = self.first_header_block(t.triple())
                                 && key[2] != *o
                             {
-                                let bare = self.annotation(&key)?;
-                                self.o.insert(OntologyAnnotation(bare));
+                                bare = Some(self.annotation(&key)?);
                             }
                             ann
                         }
                         _ => ann,
                     };
                     for ann in ann {
-                        self.o.insert(OntologyAnnotation(ann));
+                        self.ontology_annotations.push(ann);
                     }
+                    self.ontology_annotations.extend(bare);
                 }
                 [Term::Iri(iri), Term::RDFS(rdfs), _] if rdfs.is_builtin() => {
                     firi(self, t.triple(), iri)?
@@ -3833,7 +3839,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                         _ => ann,
                     };
                     for ann in ann {
-                        self.o.insert(OntologyAnnotation(ann));
+                        self.ontology_annotations.push(ann);
                     }
                 }
                 continue;
@@ -4111,6 +4117,14 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
         }
         for component in std::mem::take(&mut self.bare_twins) {
             self.o.remove(&AnnotatedComponent { component, ann: BTreeSet::new() });
+        }
+        let annotations = std::mem::take(&mut self.ontology_annotations);
+        let annotations = match self.config.hold_ontology_annotations {
+            Some(hold) => hold(annotations),
+            None => annotations,
+        };
+        for a in annotations {
+            self.o.insert(OntologyAnnotation(a));
         }
         self.state = OntologyParserState::Parse;
         Ok(())
