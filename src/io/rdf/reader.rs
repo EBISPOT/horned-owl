@@ -3483,7 +3483,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                         Atom::DataPropertyAtom {
                             pred: self.convert_to_dp(pred)?,
                             args: (
-                                self.retrieve_to_dargument(arg1)?,
+                                self.retrieve_to_iargument(arg1)?,
                                 self.retrieve_to_dargument(arg2)?,
                             )
                         }

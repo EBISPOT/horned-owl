@@ -1815,7 +1815,7 @@ fn owlapi_atom_cmp<A: ForIRI>(a: &Atom<A>, b: &Atom<A>) -> Ordering {
             DataPropertyAtom { pred: p1, args: (x1, y1) },
             DataPropertyAtom { pred: p2, args: (x2, y2) },
         ) => owlapi_iri_cmp(p1.0.as_ref(), p2.0.as_ref())
-            .then_with(|| owlapi_darg_cmp(x1, x2))
+            .then_with(|| owlapi_iarg_cmp(x1, x2))
             .then_with(|| owlapi_darg_cmp(y1, y2)),
         (BuiltInAtom { pred: p1, args: v1 }, BuiltInAtom { pred: p2, args: v2 }) => {
             let mut c = owlapi_iri_cmp(p1.as_ref(), p2.as_ref());

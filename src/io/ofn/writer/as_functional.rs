@@ -795,9 +795,10 @@ impl<A: ForIRI> Display for Functional<'_, Atom<A>, A> {
             DataPropertyAtom { pred, args } => {
                 write!(
                     f,
-                    "DataPropertyAtom({} {})",
+                    "DataPropertyAtom({} {} {})",
                     Functional(&pred, self.1, None),
-                    Functional(&(&args.0, &args.1), self.1, None),
+                    Functional(&args.0, self.1, None),
+                    Functional(&args.1, self.1, None),
                 )
             }
             DataRangeAtom { pred, arg } => {

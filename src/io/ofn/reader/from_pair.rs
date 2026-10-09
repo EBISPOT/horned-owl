@@ -548,9 +548,9 @@ impl<A: ForIRI> FromPair<A> for Atom<A> {
             Rule::AtomDataProperty => {
                 let mut pairs = inner.into_inner();
                 let pred = FromPair::from_pair(pairs.next().unwrap(), ctx)?;
-                let d1 = DArgument::from_pair(pairs.next().unwrap(), ctx)?;
-                let d2 = DArgument::from_pair(pairs.next().unwrap(), ctx)?;
-                let args = (d1, d2);
+                let i = IArgument::from_pair(pairs.next().unwrap(), ctx)?;
+                let d = DArgument::from_pair(pairs.next().unwrap(), ctx)?;
+                let args = (i, d);
                 Ok(Atom::DataPropertyAtom { pred, args })
             }
             Rule::AtomBuiltIn => {
@@ -1353,26 +1353,43 @@ mod tests {
 
     #[test]
     fn data_property_atom() {
+        // The subject is an individual argument, a variable or an individual,
+        // and the object a data argument.
         let build = Build::<String>::new();
         let mut mapping = PrefixMapping::default();
         mapping.add_prefix("o", "https://example.com/").unwrap();
-        let txt = "DataPropertyAtom(o:d Variable(o:x) \"Literal String\")";
-
-        let expected = Atom::DataPropertyAtom {
-            pred: build.data_property("https://example.com/d"),
-            args: (
-                DArgument::Variable(build.variable("https://example.com/x")),
-                DArgument::Literal(Literal::Simple {
-                    literal: String::from("Literal String"),
-                }),
+        let cases = [
+            (
+                "DataPropertyAtom(o:d Variable(o:x) \"Literal String\")",
+                Atom::DataPropertyAtom {
+                    pred: build.data_property("https://example.com/d"),
+                    args: (
+                        IArgument::Variable(build.variable("https://example.com/x")),
+                        DArgument::Literal(Literal::Simple {
+                            literal: String::from("Literal String"),
+                        }),
+                    ),
+                },
             ),
-        };
-        let pair = OwlFunctionalLexer::lex(Rule::Atom, txt)
-            .unwrap()
-            .next()
-            .unwrap();
-        let actual = Atom::from_pair(pair, &Context::new(&build, &mapping)).unwrap();
-        pretty_assertions::assert_eq!(actual, expected);
+            (
+                "DataPropertyAtom(o:d o:i Variable(o:y))",
+                Atom::DataPropertyAtom {
+                    pred: build.data_property("https://example.com/d"),
+                    args: (
+                        IArgument::Individual(build.named_individual("https://example.com/i").into()),
+                        DArgument::Variable(build.variable("https://example.com/y")),
+                    ),
+                },
+            ),
+        ];
+        for (txt, expected) in cases {
+            let pair = OwlFunctionalLexer::lex(Rule::Atom, txt)
+                .unwrap()
+                .next()
+                .unwrap();
+            let actual = Atom::from_pair(pair, &Context::new(&build, &mapping)).unwrap();
+            pretty_assertions::assert_eq!(actual, expected, "{txt}");
+        }
     }
 
     /// Every bubo-generated `.ofn` fixture must describe the same ontology as
