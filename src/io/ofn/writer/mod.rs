@@ -89,6 +89,55 @@ pub fn write_stream<A: ForIRI, AA: ForIndex<A>, W: Write>(
     Ok(write)
 }
 
+fn xml_name_start(c: u32) -> bool {
+    c == b':' as u32
+        || (b'A' as u32..=b'Z' as u32).contains(&c)
+        || c == b'_' as u32
+        || (b'a' as u32..=b'z' as u32).contains(&c)
+        || (0xC0..=0xD6).contains(&c)
+        || (0xD8..=0xF6).contains(&c)
+        || (0xF8..=0x2FF).contains(&c)
+        || (0x370..=0x37D).contains(&c)
+        || (0x37F..=0x1FFF).contains(&c)
+        || (0x200C..=0x200D).contains(&c)
+        || (0x2070..=0x218F).contains(&c)
+        || (0x2C00..=0x2FEF).contains(&c)
+        || (0x3001..=0xD7FF).contains(&c)
+        || (0xF900..=0xFDCF).contains(&c)
+        || (0xFDF0..=0xFFFD).contains(&c)
+        || (0x10000..=0xEFFFF).contains(&c)
+}
+
+fn xml_name_char(c: u32) -> bool {
+    xml_name_start(c)
+        || c == b'-' as u32
+        || c == b'.' as u32
+        || (b'0' as u32..=b'9' as u32).contains(&c)
+        || c == 0xB7
+        || (0x0300..=0x036F).contains(&c)
+        || (0x203F..=0x2040).contains(&c)
+}
+
+/// OWLAPI `XMLUtils.getNCNameSuffixIndex`: where the local part begins, or `None`
+/// when the whole string is the namespace.
+pub(crate) fn ncname_suffix_index(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.len() > 1 && b[0] == b'_' && b[1] == b':' {
+        return None;
+    }
+    let mut index = None;
+    for (i, ch) in s.char_indices().rev() {
+        let cp = ch as u32;
+        if cp != ':' as u32 && xml_name_start(cp) {
+            index = Some(i);
+        }
+        if !(cp != ':' as u32 && xml_name_char(cp)) {
+            break;
+        }
+    }
+    index
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

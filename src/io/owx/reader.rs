@@ -96,13 +96,16 @@ impl<A: ForIRI, R: BufRead, B: AsRef<Build<A>>> Reader<A, R, B> {
                 (ref ns, Event::Start(ref e)) | (ref ns, Event::Empty(ref e)) if is_owl(ns) => {
                     match e.local_name().as_ref() {
                         b"Ontology" => {
+                            // The ontology's IRIs are taken as written, never
+                            // expanded or resolved.
                             let s = get_attr_value_str(&mut self.r.reader, e, b"ontologyIRI")?;
+                            let v = get_attr_value_str(&mut self.r.reader, e, b"versionIRI")?;
+                            let iri = s.as_deref().map(|s| self.r.build.as_ref().iri(s));
+                            let viri = v.map(|v| self.r.build.as_ref().iri(v));
                             if let Some(s) = s {
                                 self.r.mapping.set_default(&s);
                                 self.r.base_iri = Some(s);
                             }
-                            let iri = get_iri_value_for(&mut self.r, e, b"ontologyIRI")?;
-                            let viri = get_iri_value_for(&mut self.r, e, b"versionIRI")?;
                             return Ok(Some(StreamComponent::Component(AnnotatedComponent::new(
                                 OntologyID { iri, viri },
                                 BTreeSet::new(),
@@ -215,8 +218,11 @@ pub fn read<A: ForIRI, B: AsRef<Build<A>>, O: MutableOntology<A> + Default, R: B
     bufread: &mut R,
     config: ParserConfiguration<A, B>,
 ) -> Result<(O, PrefixMapping), HornedError> {
+    // Of two components that differ only in typing a string `xsd:string`, the
+    // ontology holds the first.
+    let mut ont: crate::io::first_stated::FirstStated<A, O> =
+        crate::io::first_stated::FirstStated::new(config.hold_ontology_annotations);
     let mut reader = Reader::new(bufread, config);
-    let mut ont: O = Default::default();
 
     for item in reader.by_ref() {
         match item? {
@@ -228,7 +234,7 @@ pub fn read<A: ForIRI, B: AsRef<Build<A>>, O: MutableOntology<A> + Default, R: B
         }
     }
 
-    Ok((ont, reader.r.mapping))
+    Ok((ont.into_inner(), reader.r.mapping))
 }
 
 fn decode_expand_curie_maybe<'a, A: ForIRI, R: BufRead, B: AsRef<Build<A>>>(
@@ -582,22 +588,18 @@ from_start! {
             // Finally, we add the unescaped string to the literal we are building.
             literal.push_str(&unescaped_str);
         }
+        // A datatype other than `rdf:PlainLiteral` types the text, `xsd:string`
+        // included, and a language beside it is ignored. Otherwise the text is
+        // plain, or tagged with its language, and is never split at an `@`.
         Ok(
             match (datatype_iri, lang, literal) {
-                (None, None, literal) =>
-                    Literal::Simple{literal},
-                (Some(ref datatype_iri), None, literal)
-                    if **datatype_iri == *"http://www.w3.org/2001/XMLSchema#string" =>
-                    Literal::Simple{literal},
-                (None, Some(lang), literal) =>
+                (Some(datatype_iri), _, literal)
+                    if *datatype_iri != *"http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral" =>
+                    Literal::Datatype{literal, datatype_iri},
+                (_, Some(lang), literal) =>
                     Literal::Language{literal, lang},
-                (Some(ref datatype_iri), Some(ref lang), ref literal)
-                    if **datatype_iri == *"http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral"
-                    => Literal::Language{literal:literal.to_string(), lang:lang.to_string()},
-                (Some(_), Some(_), _)
-                    => return Err(invalid_at!(r.reader.buffer_position(), "Broken literal")),
-                (Some(datatype_iri), None, literal)
-                    => Literal::Datatype{literal, datatype_iri},
+                (_, None, literal) =>
+                    Literal::Simple{literal},
             })
     }
 }
@@ -640,12 +642,6 @@ fn axiom_from_start<A: ForIRI, R: BufRead, B: AsRef<Build<A>>>(
     axiom_kind: &[u8],
 ) -> Result<Component<A>, HornedError> {
     Ok(match axiom_kind {
-        b"Annotation" => OntologyAnnotation(Annotation {
-            ap: from_start(r, e)?,
-            av: from_next(r)?,
-            ann: Default::default(),
-        })
-        .into(),
         b"Declaration" => {
             let ne: NamedOWLEntity<_> = from_start(r, e)?;
             ne.into()
@@ -1039,6 +1035,14 @@ from_start! {
     {
         let mut annotation: BTreeSet<Annotation<_>> = BTreeSet::new();
         let axiom_kind = e.local_name();
+        // The ontology's annotation is one annotation: the annotations nested
+        // in it are its own, not an axiom's.
+        if axiom_kind.as_ref() == b"Annotation" {
+            return Ok(AnnotatedComponent {
+                component: OntologyAnnotation(Annotation::from_xml(r, b"Annotation")?).into(),
+                ann: annotation,
+            });
+        }
         let mut buf = Vec::new();
 
         loop {
@@ -1651,6 +1655,19 @@ pub mod test {
     }
 
     #[test]
+    fn ontology_iris_are_taken_as_written() {
+        let ont_s = r#"<?xml version="1.0"?>
+<Ontology xmlns="http://www.w3.org/2002/07/owl#" ontologyIRI="rel/o.owl" versionIRI="rel/v.owl">
+    <Declaration><Class IRI="http://example.org/o#A"/></Declaration>
+</Ontology>"#;
+        let (o, _) = read_ok(&mut ont_s.as_bytes());
+        let o: SetOntology<RcStr> = o.into();
+        let id = o.i().the_ontology_id_or_default();
+        assert_eq!(id.iri.as_deref(), Some("rel/o.owl"));
+        assert_eq!(id.viri.as_deref(), Some("rel/v.owl"));
+    }
+
+    #[test]
     fn read_to_stream_agrees_with_read() {
         let ont_s = include_str!("../../ont/owl-xml/ont.owx");
         let b = Build::new_rc();
@@ -1879,6 +1896,53 @@ pub mod test {
             String::from(&ann.ap),
             "http://www.w3.org/2000/01/rdf-schema#comment"
         );
+    }
+
+    /// The ontology's annotation keeps the annotations nested in it, as an
+    /// annotation of an axiom does, and the component itself carries none.
+    #[test]
+    fn ontology_annotation_keeps_its_annotations() {
+        let ont_s = r##"<?xml version="1.0"?>
+<Ontology xmlns="http://www.w3.org/2002/07/owl#"
+     xml:base="http://example.org/r"
+     xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+     ontologyIRI="http://example.org/r">
+    <Prefix name="rdfs" IRI="http://www.w3.org/2000/01/rdf-schema#"/>
+    <Annotation>
+        <Annotation>
+            <Annotation>
+                <AnnotationProperty abbreviatedIRI="rdfs:comment"/>
+                <Literal>three</Literal>
+            </Annotation>
+            <AnnotationProperty abbreviatedIRI="rdfs:comment"/>
+            <Literal>two</Literal>
+        </Annotation>
+        <AnnotationProperty abbreviatedIRI="rdfs:comment"/>
+        <Literal>one</Literal>
+    </Annotation>
+    <Declaration>
+        <Class IRI="#A"/>
+    </Declaration>
+</Ontology>"##;
+        let (ont, _) = read_ok(&mut ont_s.as_bytes());
+        let anns: Vec<_> = ont
+            .i()
+            .component_for_kind(ComponentKind::OntologyAnnotation)
+            .collect();
+        assert_eq!(anns.len(), 1);
+        assert!(anns[0].ann.is_empty(), "{:?}", anns[0]);
+        let Component::OntologyAnnotation(OntologyAnnotation(one)) = &anns[0].component else {
+            panic!("{:?}", anns[0]);
+        };
+        let literal = |a: &Annotation<RcStr>| match &a.av {
+            AnnotationValue::Literal(Literal::Simple { literal }) => literal.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(literal(one), "one");
+        let two = one.ann.iter().next().expect("the annotation's annotation");
+        assert_eq!(literal(two), "two");
+        let three = two.ann.iter().next().expect("the third level");
+        assert_eq!(literal(three), "three");
     }
 
     #[test]
@@ -2263,6 +2327,45 @@ pub mod test {
             AnnotationValue::Literal(l) => assert_eq!(l.literal(), &String::from("A --> B")),
             _ => panic!("expected literal annotation value"),
         }
+    }
+
+    /// `rdf:PlainLiteral` text is plain, or tagged with the language beside
+    /// it, and is never split at an `@`; another datatype types the text, and
+    /// a language beside it is ignored.
+    #[test]
+    fn test_literal_datatype_and_language() {
+        let ont_s = r#"<?xml version="1.0"?>
+<Ontology xmlns="http://www.w3.org/2002/07/owl#" ontologyIRI="http://example.org/l">
+    <AnnotationAssertion><AnnotationProperty IRI="http://example.org/l#p"/><IRI>http://example.org/l#a</IRI><Literal datatypeIRI="http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral">x@en</Literal></AnnotationAssertion>
+    <AnnotationAssertion><AnnotationProperty IRI="http://example.org/l#p"/><IRI>http://example.org/l#b</IRI><Literal datatypeIRI="http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral" xml:lang="fr">y</Literal></AnnotationAssertion>
+    <AnnotationAssertion><AnnotationProperty IRI="http://example.org/l#p"/><IRI>http://example.org/l#c</IRI><Literal datatypeIRI="http://www.w3.org/2001/XMLSchema#integer" xml:lang="fr">5</Literal></AnnotationAssertion>
+</Ontology>"#;
+        let (ont, _) = read_ok(&mut ont_s.as_bytes());
+        let b = Build::new_rc();
+        let values: Vec<_> = ont
+            .i()
+            .annotation_assertion()
+            .map(|aa| aa.ann.av.clone())
+            .collect();
+        for want in [
+            Literal::Simple {
+                literal: "x@en".to_string(),
+            },
+            Literal::Language {
+                literal: "y".to_string(),
+                lang: "fr".to_string(),
+            },
+            Literal::Datatype {
+                literal: "5".to_string(),
+                datatype_iri: b.iri("http://www.w3.org/2001/XMLSchema#integer"),
+            },
+        ] {
+            assert!(
+                values.contains(&AnnotationValue::Literal(want.clone())),
+                "{want:?} not in {values:?}"
+            );
+        }
+        assert_eq!(values.len(), 3);
     }
 
     #[test]

@@ -169,16 +169,24 @@ impl<A: ForIRI> FromPair<A> for IRI<A> {
         match inner.as_rule() {
             Rule::AbbreviatedIRI => {
                 let span = inner.as_span();
-                // AbbreviatedIRI = { SPARQL_PnameLn }
+                // AbbreviatedIRI = { SPARQL_PnameLn | PrefixIRI }
                 // SPARQL_PnameLn = ${ SPARQL_PnameNs ~ SPARQL_PnLocal }
                 // SPARQL_PnameNs = ${ SPARQL_PnPrefix? ~ ":" }
-                let mut pname = inner.into_inner().next().unwrap().into_inner();
-                let prefix_part = pname.next().unwrap().into_inner().next();
-                let local = pname.next().unwrap();
-                let curie = Curie::new(
-                    Some(prefix_part.map(|p| p.as_str()).unwrap_or_default()),
-                    local.as_str(),
-                );
+                // PrefixIRI      = ${ !SectionKeyword ~ SPARQL_PnPrefix ~ ":" ~ … }
+                let name = inner.into_inner().next().unwrap();
+                let (prefix, local) = match name.as_rule() {
+                    Rule::PrefixIRI => (name.into_inner().next().unwrap().as_str(), ""),
+                    _ => {
+                        let mut pname = name.into_inner();
+                        let prefix_part = pname.next().unwrap().into_inner().next();
+                        let local = pname.next().unwrap();
+                        (
+                            prefix_part.map(|p| p.as_str()).unwrap_or_default(),
+                            local.as_str(),
+                        )
+                    }
+                };
+                let curie = Curie::new(Some(prefix), local);
                 match ctx.prefixes.expand_curie(&curie) {
                     Ok(s) => Ok(ctx.build.iri(s)),
                     Err(curie::ExpansionError::Invalid) => {
@@ -190,9 +198,22 @@ impl<A: ForIRI> FromPair<A> for IRI<A> {
                 }
             }
             Rule::FullIRI => {
-                // FullIRI = ${ "<" ~ RFC3987_Iri ~ ">" }
-                let iri = inner.into_inner().next().unwrap();
-                Ok(ctx.build.iri(iri.as_str()))
+                // A full IRI that holds a colon names the IRI it encloses; one
+                // that holds none is a local name of the default prefix, its
+                // angle brackets and all.
+                let span = inner.as_span();
+                let token = inner.as_str();
+                let text = inner.into_inner().next().unwrap().as_str();
+                if text.contains(':') {
+                    return Ok(ctx.build.iri(text));
+                }
+                match ctx.prefixes.expand_curie(&Curie::new(Some(""), token)) {
+                    Ok(s) => Ok(ctx.build.iri(s)),
+                    Err(_) => Err(HornedError::invalid_at(
+                        "Prefix not registered for prefix name: :",
+                        span,
+                    )),
+                }
             }
             Rule::SimpleIRI => {
                 // SimpleIRI = { SPARQL_PnLocal } — a bare local name resolved
@@ -214,6 +235,35 @@ impl<A: ForIRI> FromPair<A> for IRI<A> {
             rule => unreachable!("unexpected rule in IRI::from_pair: {:?}", rule),
         }
     }
+}
+
+/// The IRI an ontology header, an import or an annotation value names: a full
+/// IRI as it is written, and a name as an entity's is read.
+pub(crate) fn written_iri<A: ForIRI>(pair: Pair<Rule>, ctx: &Context<'_, A>) -> Result<IRI<A>> {
+    let inner = pair.clone().into_inner().next().unwrap();
+    if inner.as_rule() == Rule::FullIRI {
+        Ok(ctx.build.iri(inner.into_inner().next().unwrap().as_str()))
+    } else {
+        IRI::from_pair(pair, ctx)
+    }
+}
+
+/// A rule variable, `?` and an IRI. A full IRI names the IRI as it is
+/// written, but one whose namespace is `urn:swrl#` is moved to
+/// `urn:swrl:var#`; a name `n` names `urn:swrl:var#n`.
+fn variable<A: ForIRI>(pair: Pair<Rule>, ctx: &Context<'_, A>) -> Variable<A> {
+    let inner = pair.clone().into_inner().next().unwrap();
+    let iri = if inner.as_rule() == Rule::FullIRI {
+        let text = inner.into_inner().next().unwrap().as_str();
+        let split = crate::io::ofn::writer::ncname_suffix_index(text).unwrap_or(text.len());
+        match text.split_at(split) {
+            ("urn:swrl#", fragment) => format!("urn:swrl:var#{fragment}"),
+            _ => text.to_string(),
+        }
+    } else {
+        format!("urn:swrl:var#{}", pair.as_str())
+    };
+    Variable(ctx.build.iri(iri))
 }
 
 // ---------------------------------------------------------------------------
@@ -271,9 +321,17 @@ impl<A: ForIRI> FromPair<A> for Literal<A> {
             }
             // §2.5 bare numeric literals: the lexical text IS the value; the
             // datatype is fixed by the production (integer/decimal/float).
-            Rule::IntegerLiteral => Ok(Literal::Datatype {
-                literal: inner.as_str().to_string(),
-                datatype_iri: ctx.build.iri("http://www.w3.org/2001/XMLSchema#integer"),
+            // An integer is its value as a 32-bit integer prints it (`+7` and
+            // `007` are `7`); one out of that range is a decimal, as written.
+            Rule::IntegerLiteral => Ok(match inner.as_str().parse::<i32>() {
+                Ok(i) => Literal::Datatype {
+                    literal: i.to_string(),
+                    datatype_iri: ctx.build.iri("http://www.w3.org/2001/XMLSchema#integer"),
+                },
+                Err(_) => Literal::Datatype {
+                    literal: inner.as_str().to_string(),
+                    datatype_iri: ctx.build.iri("http://www.w3.org/2001/XMLSchema#decimal"),
+                },
             }),
             Rule::DecimalLiteral => Ok(Literal::Datatype {
                 literal: inner.as_str().to_string(),
@@ -954,7 +1012,7 @@ impl<A: ForIRI> FromPair<A> for AnnotationValue<A> {
         let inner = pair.into_inner().next().unwrap();
         match inner.as_rule() {
             Rule::Literal => Ok(AnnotationValue::Literal(Literal::from_pair(inner, ctx)?)),
-            Rule::IRI => Ok(AnnotationValue::IRI(IRI::from_pair(inner, ctx)?)),
+            Rule::IRI => Ok(AnnotationValue::IRI(written_iri(inner, ctx)?)),
             Rule::AnonymousIndividual => {
                 let label = inner.as_str();
                 let id = label.strip_prefix("_:").unwrap_or(label);
@@ -1034,7 +1092,7 @@ pub(crate) fn prefixes_from_decls<'a>(
         let mut inner = decl.into_inner();
         let pname = inner.next().unwrap(); // PrefixName
         let full_iri = inner.next().unwrap(); // FullIRI
-        // FullIRI = ${ "<" ~ RFC3987_Iri ~ ">" } — its inner is the bare IRI text.
+        // A prefix's IRI is taken as it is written.
         let iri_text = full_iri.into_inner().next().unwrap().as_str();
         // PrefixName = { SPARQL_PnameNs }; SPARQL_PnameNs = ${ SPARQL_PnPrefix? ~ ":" }
         let prefix_part = pname.into_inner().next().unwrap().into_inner().next();
@@ -1153,13 +1211,13 @@ type AnnItem<A, T> = (BTreeSet<Annotation<A>>, T);
 /// A leading `Annotations` pair attaches to the item that follows it; items
 /// without a preceding `Annotations` carry an empty set. Behaviour is identical
 /// to a plain list when no per-item annotations are present.
-fn parse_annotated_list<A: ForIRI, T, F>(
-    list: Pair<Rule>,
+fn parse_annotated_list<'i, A: ForIRI, T, F>(
+    list: Pair<'i, Rule>,
     ctx: &Context<'_, A>,
     mut item: F,
 ) -> Result<Vec<AnnItem<A, T>>>
 where
-    F: FnMut(Pair<Rule>, &Context<'_, A>) -> Result<T>,
+    F: FnMut(Pair<'i, Rule>, &Context<'_, A>) -> Result<T>,
 {
     let mut out = Vec::new();
     let mut pending: BTreeSet<Annotation<A>> = BTreeSet::new();
@@ -1494,10 +1552,8 @@ pub(crate) fn insert_misc<A: ForIRI, O: MutableOntology<A>>(
 fn parse_data_range_list<A: ForIRI>(
     list: Pair<Rule>,
     ctx: &Context<'_, A>,
-) -> Result<Vec<DataRange<A>>> {
-    list.into_inner()
-        .map(|p| DataRange::from_pair(p, ctx))
-        .collect()
+) -> Result<Vec<AnnItem<A, DataRange<A>>>> {
+    parse_annotated_list(list, ctx, DataRange::from_pair)
 }
 
 fn insert_object_property_frame<A: ForIRI, O: MutableOntology<A>>(
@@ -1654,10 +1710,10 @@ fn insert_object_property_frame<A: ForIRI, O: MutableOntology<A>>(
             "characteristics" => {
                 // §2.5 objectPropertyCharacteristicAnnotatedList: a LEADING
                 // clause-level annotation binds the FIRST item only.
-                let empty = BTreeSet::new();
-                for (i, ch) in body.into_inner().enumerate() {
-                    let item_ann = if i == 0 { &ann } else { &empty };
-                    insert_object_characteristic(ch.as_str(), &subject_ope, item_ann, ont)?;
+                let mut list = parse_annotated_list(body, ctx, |p, _| Ok(p))?;
+                bind_leading_to_first(ann, &mut list);
+                for (item_ann, ch) in list {
+                    insert_object_characteristic(ch.as_str(), &subject_ope, &item_ann, ont)?;
                 }
             }
             other => unreachable!("unexpected object-property clause keyword: {other}"),
@@ -1729,10 +1785,7 @@ fn swrl_arg_kind<A: ForIRI>(arg: Pair<Rule>, ctx: &Context<'_, A>) -> Result<Swr
     let inner = arg.into_inner().next().unwrap();
     Ok(match inner.as_rule() {
         // `Variable = { "?" ~ IRI }`
-        Rule::Variable => SwrlArgKind::Var(Variable(IRI::from_pair(
-            inner.into_inner().next().unwrap(),
-            ctx,
-        )?)),
+        Rule::Variable => SwrlArgKind::Var(variable(inner.into_inner().next().unwrap(), ctx)),
         Rule::Literal => SwrlArgKind::Lit(Literal::from_pair(inner, ctx)?),
         Rule::Individual => SwrlArgKind::Ind(Individual::from_pair(inner, ctx)?),
         rule => unreachable!("unexpected SWRL argument: {:?}", rule),
@@ -1972,28 +2025,31 @@ fn insert_data_property_frame<A: ForIRI, O: MutableOntology<A>>(
                 }
             }
             "range" => {
-                for dr in parse_data_range_list(body, ctx)? {
+                // §2.5 dataRangeAnnotatedList: leading annotation binds the FIRST item only.
+                let mut list = parse_data_range_list(body, ctx)?;
+                bind_leading_to_first(ann, &mut list);
+                for (item_ann, dr) in list {
                     ont.insert(AnnotatedComponent {
                         component: Component::DataPropertyRange(DataPropertyRange {
                             dp: DataProperty(subject.clone()),
                             dr,
                         }),
-                        ann: ann.clone(),
+                        ann: item_ann,
                     });
                 }
             }
             "characteristics" => {
                 // §2.5: leading clause-level annotation binds the FIRST item only.
-                let empty = BTreeSet::new();
-                for (i, ch) in body.into_inner().enumerate() {
-                    let item_ann = if i == 0 { &ann } else { &empty };
+                let mut list = parse_annotated_list(body, ctx, |p, _| Ok(p))?;
+                bind_leading_to_first(ann, &mut list);
+                for (item_ann, ch) in list {
                     // Only Functional is valid on a data property.
                     if ch.as_str().eq_ignore_ascii_case("functional") {
                         ont.insert(AnnotatedComponent {
                             component: Component::FunctionalDataProperty(FunctionalDataProperty(
                                 DataProperty(subject.clone()),
                             )),
-                            ann: item_ann.clone(),
+                            ann: item_ann,
                         });
                     } else {
                         return Err(HornedError::invalid(
@@ -2133,10 +2189,10 @@ fn insert_individual_frame<A: ForIRI, O: MutableOntology<A>>(
             }
             "facts" => {
                 // §2.5 factAnnotatedList: leading annotation binds the FIRST item only.
-                let empty = BTreeSet::new();
-                for (i, fact) in body.into_inner().enumerate() {
-                    let item_ann = if i == 0 { &ann } else { &empty };
-                    insert_fact(fact, ctx, &subject_ind, item_ann, ont)?;
+                let mut list = parse_annotated_list(body, ctx, |p, _| Ok(p))?;
+                bind_leading_to_first(ann, &mut list);
+                for (item_ann, fact) in list {
+                    insert_fact(fact, ctx, &subject_ind, &item_ann, ont)?;
                 }
             }
             "sameas" => {
@@ -2340,10 +2396,232 @@ mod tests {
         );
     }
 
+    /// A prefix name standing alone names the prefix's own IRI, wherever an IRI
+    /// may stand; a section keyword after it is still a keyword.
+    #[test]
+    fn reads_a_prefix_name_standing_alone() {
+        use crate::ontology::set::SetOntology;
+        use std::io::BufReader;
+
+        let doc = r#"Prefix: idsfor: <http://purl.obolibrary.org/obo/IAO_0000598>
+Prefix: allocatedto: <http://purl.obolibrary.org/obo/IAO_0000597>
+Prefix: idrange: <http://purl.obolibrary.org/obo/ro/idrange/>
+Prefix: xsd: <http://www.w3.org/2001/XMLSchema#>
+
+Ontology: <http://ex/idranges>
+
+Annotations:
+    idsfor: "SINK"
+
+AnnotationProperty: idsfor:
+
+AnnotationProperty: allocatedto:
+
+Datatype: idrange:1
+    Annotations:
+        allocatedto: "ONTOLOGY-CREATOR"
+    EquivalentTo:
+        xsd:integer[>= 0 , <= 999999]
+"#;
+        let b = Build::new_rc();
+        let (o, _): (SetOntology<RcStr>, PrefixMapping) = crate::io::omn::reader::read(
+            BufReader::new(doc.as_bytes()),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let components: std::collections::BTreeSet<_> =
+            o.iter().map(|ac| ac.component.clone()).collect();
+        let idsfor = b.annotation_property("http://purl.obolibrary.org/obo/IAO_0000598");
+        let allocatedto = b.annotation_property("http://purl.obolibrary.org/obo/IAO_0000597");
+        let range = b.datatype("http://purl.obolibrary.org/obo/ro/idrange/1");
+        assert!(components.contains(&Component::from(DeclareAnnotationProperty(idsfor.clone()))));
+        assert!(
+            components.contains(&Component::from(DeclareAnnotationProperty(
+                allocatedto.clone()
+            )))
+        );
+        assert!(
+            components.contains(&Component::from(OntologyAnnotation(Annotation {
+                ap: idsfor,
+                av: AnnotationValue::Literal(Literal::Simple {
+                    literal: "SINK".into()
+                }),
+                ann: BTreeSet::new(),
+            })))
+        );
+        assert!(components.contains(&Component::from(AnnotationAssertion {
+            subject: AnnotationSubject::IRI(range.0.clone()),
+            ann: Annotation {
+                ap: allocatedto,
+                av: AnnotationValue::Literal(Literal::Simple {
+                    literal: "ONTOLOGY-CREATOR".into()
+                }),
+                ann: BTreeSet::new(),
+            },
+        })));
+        assert!(
+            components
+                .iter()
+                .any(|c| matches!(c, Component::DatatypeDefinition(d) if d.kind == range))
+        );
+    }
+
+    /// A full IRI with a colon names what it encloses, whatever characters it
+    /// holds, and one with none is a local name of the default prefix, angle
+    /// brackets and all; the ontology header, prefix declarations and
+    /// annotation values take a full IRI as it is written. A rule variable
+    /// `?n` is `urn:swrl:var#n`, and one in `urn:swrl#` moves there. An
+    /// undeclared `dc:` names Dublin Core's elements.
+    #[test]
+    fn reads_full_iris_where_they_stand() {
+        use crate::ontology::set::SetOntology;
+        use std::collections::BTreeSet;
+        use std::io::BufReader;
+
+        let doc = r#"Prefix: : <http://example.org/o#>
+Prefix: ex: <rel/>
+Prefix: rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+Ontology: <http://example.org/o> <rel/v.owl>
+AnnotationProperty: rdfs:seeAlso
+Class: :A
+    Annotations: rdfs:seeAlso <a.owl#C>, rdfs:seeAlso <http://example.org/{z}>
+Class: :B
+Class: <http://example.org/{x}>
+Class: <{y}>
+Class: <a/b:c>
+Class: ex:D
+Rule: :A(?x) -> :B(?x)
+Rule: :A(?<urn:swrl#y>) -> :B(?<urn:swrl#y>)
+Rule: :A(?<w>) -> :B(?<w>)
+Rule: :A(?ex:v) -> :B(?ex:v)
+"#;
+        let b = Build::new_rc();
+        let (o, pm): (SetOntology<RcStr>, PrefixMapping) = crate::io::omn::reader::read(
+            BufReader::new(doc.as_bytes()),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        assert_eq!(pm.expand_curie_string("ex:D").unwrap(), "rel/D");
+        let (mut classes, mut values, mut variables) =
+            (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        for ac in o.iter() {
+            match &ac.component {
+                Component::OntologyID(id) => {
+                    assert_eq!(id.viri.as_deref(), Some("rel/v.owl"));
+                }
+                Component::DeclareClass(DeclareClass(c)) => {
+                    classes.insert(c.0.to_string());
+                }
+                Component::AnnotationAssertion(AnnotationAssertion { ann, .. }) => {
+                    if let AnnotationValue::IRI(i) = &ann.av {
+                        values.insert(i.to_string());
+                    }
+                }
+                Component::Rule(r) => {
+                    for atom in r.body.iter().chain(r.head.iter()) {
+                        if let Atom::ClassAtom {
+                            arg: IArgument::Variable(v),
+                            ..
+                        } = atom
+                        {
+                            variables.insert(v.0.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let set = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            classes,
+            set(&[
+                "a/b:c",
+                "http://example.org/o#<{y}>",
+                "http://example.org/o#A",
+                "http://example.org/o#B",
+                "http://example.org/{x}",
+                "rel/D",
+            ])
+        );
+        assert_eq!(values, set(&["a.owl#C", "http://example.org/{z}"]));
+        assert_eq!(
+            variables,
+            set(&["urn:swrl:var#ex:v", "urn:swrl:var#x", "urn:swrl:var#y", "w"])
+        );
+
+        // An undeclared `dc:` is Dublin Core's elements namespace.
+        let doc = "Ontology: <http://example.org/o>\nAnnotationProperty: dc:title\n";
+        let (o, pm): (SetOntology<RcStr>, PrefixMapping) = crate::io::omn::reader::read(
+            BufReader::new(doc.as_bytes()),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        assert_eq!(
+            pm.expand_curie_string("dc:").unwrap(),
+            "http://purl.org/dc/elements/1.1/"
+        );
+        assert!(o.iter().any(|ac| matches!(&ac.component,
+            Component::DeclareAnnotationProperty(DeclareAnnotationProperty(p))
+                if &*p.0 == "http://purl.org/dc/elements/1.1/title")));
+
+        // With no default prefix, a full IRI with no colon names nothing.
+        let doc = "Ontology: <http://example.org/o>\nClass: <a.owl#C>\n";
+        let read: Result<(SetOntology<RcStr>, PrefixMapping)> = crate::io::omn::reader::read(
+            BufReader::new(doc.as_bytes()),
+            crate::io::ParserConfiguration::new(&b),
+        );
+        assert!(
+            read.unwrap_err()
+                .to_string()
+                .contains("Prefix not registered for prefix name: :")
+        );
+    }
+
     /// §2.5 allows bare numeric literals (integer/decimal/float) wherever a
     /// `Literal` is expected — e.g. a facet value `xsd:integer[>= 0]` or a
     /// `DataOneOf { 1, 2.5, 3.0f }`. Previously these hard-failed (the `Literal`
     /// rule only had the quoted/typed/lang forms).
+    /// A bare number in the range of a 32-bit integer is an integer, its value
+    /// printed; any other is a float when it ends in `f`, and a decimal,
+    /// written as it is, when it does not.
+    #[test]
+    fn reads_bare_numbers_by_their_form() {
+        let b = Build::new_rc();
+        let pm = curie::PrefixMapping::default();
+        let ctx = Context::new(&b, &pm);
+        let one_of = ManchesterLexer::lex(
+            Rule::DataRange,
+            "{ +7, 007, -0, 99999999999, 3e2, 1.5E-3, .5, 1., 1d, 1.5D, 1.f }",
+        )
+        .unwrap()
+        .next()
+        .unwrap();
+        let parsed = DataRange::<RcStr>::from_pair(one_of, &ctx).unwrap();
+        let DataRange::DataOneOf(lits) = parsed else {
+            panic!("expected DataOneOf, got {parsed:?}");
+        };
+        let typed = |literal: &str, datatype: &str| Literal::Datatype {
+            literal: literal.to_string(),
+            datatype_iri: b.iri(format!("http://www.w3.org/2001/XMLSchema#{datatype}")),
+        };
+        assert_eq!(
+            lits,
+            vec![
+                typed("7", "integer"),
+                typed("7", "integer"),
+                typed("0", "integer"),
+                typed("99999999999", "decimal"),
+                typed("3e2", "decimal"),
+                typed("1.5E-3", "decimal"),
+                typed(".5", "decimal"),
+                typed("1.", "decimal"),
+                typed("1d", "decimal"),
+                typed("1.5D", "decimal"),
+                typed("1.f", "float"),
+            ]
+        );
+    }
+
     #[test]
     fn reads_bare_numeric_literals() {
         let b = Build::new_rc();
@@ -3050,8 +3328,8 @@ mod tests {
         o.insert(AsymmetricObjectProperty(ope("http://ex/r")));
         o.insert(TransitiveObjectProperty(ope("http://ex/r")));
         o.insert(InverseObjectProperties(
-            b.object_property("http://ex/r").into(),
-            b.object_property("http://ex/t").into(),
+            ope("http://ex/r"),
+            ope("http://ex/t"),
         ));
 
         let amo: TestOnt = o.clone().into();
@@ -3479,8 +3757,8 @@ mod tests {
         });
         o.insert(FunctionalObjectProperty(ope("http://ex/r")));
         o.insert(InverseObjectProperties(
-            b.object_property("http://ex/r").into(),
-            b.object_property("http://ex/t").into(),
+            ope("http://ex/r"),
+            ope("http://ex/t"),
         ));
         // data property axioms
         o.insert(DataPropertyRange {
@@ -4611,6 +4889,101 @@ mod tests {
             !got.contains(&fact_ac_bad),
             "leading annotation must NOT spread to r(a,c), got:\n{got:#?}"
         );
+    }
+
+    /// `Facts:`, `Characteristics:` and a data property's `Range:` are
+    /// annotated lists: an `Annotations:` after a comma annotates the entry
+    /// it precedes, and only that one.
+    #[test]
+    fn an_annotation_after_a_comma_annotates_the_next_entry() {
+        use crate::io::omn::reader::read;
+        use crate::ontology::set::SetOntology;
+        use std::collections::BTreeSet;
+        use std::io::BufReader;
+        let b = Build::new_rc();
+        let doc = "Prefix: ex: <http://ex/>\n\
+                   Prefix: xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+                   Ontology:\n\
+                   ObjectProperty: ex:r\n    \
+                   Characteristics: Functional, Annotations: ex:note \"t\" Transitive\n\
+                   DataProperty: ex:d\n    \
+                   Range: xsd:string, Annotations: ex:note \"i\" xsd:integer\n\
+                   Individual: ex:a\n    \
+                   Facts: ex:r ex:b, Annotations: ex:note \"f\" ex:r ex:c, ex:d \"x\"\n";
+        let (parsed, _): (SetOntology<_>, PrefixMapping) = read(
+            BufReader::new(doc.as_bytes()),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let got: BTreeSet<_> = parsed.iter().cloned().collect();
+        let note = |val: &str| {
+            BTreeSet::from([Annotation {
+                ap: b.annotation_property("http://ex/note"),
+                av: AnnotationValue::Literal(Literal::Simple {
+                    literal: val.to_string(),
+                }),
+                ann: Default::default(),
+            }])
+        };
+        let r = ObjectPropertyExpression::ObjectProperty(b.object_property("http://ex/r"));
+        let d = b.data_property("http://ex/d");
+        let a = Individual::Named(b.named_individual("http://ex/a"));
+        let to = |iri: &str| Individual::Named(b.named_individual(iri));
+        let expected = [
+            AnnotatedComponent {
+                component: Component::FunctionalObjectProperty(FunctionalObjectProperty(r.clone())),
+                ann: BTreeSet::new(),
+            },
+            AnnotatedComponent {
+                component: Component::TransitiveObjectProperty(TransitiveObjectProperty(r.clone())),
+                ann: note("t"),
+            },
+            AnnotatedComponent {
+                component: Component::DataPropertyRange(DataPropertyRange {
+                    dp: d.clone(),
+                    dr: b.datatype("http://www.w3.org/2001/XMLSchema#string").into(),
+                }),
+                ann: BTreeSet::new(),
+            },
+            AnnotatedComponent {
+                component: Component::DataPropertyRange(DataPropertyRange {
+                    dp: d.clone(),
+                    dr: b
+                        .datatype("http://www.w3.org/2001/XMLSchema#integer")
+                        .into(),
+                }),
+                ann: note("i"),
+            },
+            AnnotatedComponent {
+                component: Component::ObjectPropertyAssertion(ObjectPropertyAssertion {
+                    ope: r.clone(),
+                    from: a.clone(),
+                    to: to("http://ex/b"),
+                }),
+                ann: BTreeSet::new(),
+            },
+            AnnotatedComponent {
+                component: Component::ObjectPropertyAssertion(ObjectPropertyAssertion {
+                    ope: r,
+                    from: a.clone(),
+                    to: to("http://ex/c"),
+                }),
+                ann: note("f"),
+            },
+            AnnotatedComponent {
+                component: Component::DataPropertyAssertion(DataPropertyAssertion {
+                    dp: d,
+                    from: a,
+                    to: Literal::Simple {
+                        literal: "x".to_string(),
+                    },
+                }),
+                ann: BTreeSet::new(),
+            },
+        ];
+        for ac in &expected {
+            assert!(got.contains(ac), "missing {ac:?} in:\n{got:#?}");
+        }
     }
 
     /// Our own writer emits one clause per per-item axiom, so an annotated and a

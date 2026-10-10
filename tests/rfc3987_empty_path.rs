@@ -30,9 +30,12 @@ fn non_empty_path_iris_still_parse() {
     }
 }
 
+/// A full IRI is every character up to the next `>`, as OWL API's
+/// functional-syntax parser reads it, so an empty IRI, a bare colon and a
+/// scheme that starts with a digit parse too.
 #[test]
-fn malformed_iris_are_still_rejected() {
+fn malformed_iris_parse_as_owlapi_reads_them() {
     for iri in ["", ":", "1http://ex.org/"] {
-        assert!(!parses(iri), "<{iri}> must NOT parse");
+        assert!(parses(iri), "<{iri}> must parse, as OWL API reads it");
     }
 }
