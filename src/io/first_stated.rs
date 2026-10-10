@@ -40,10 +40,17 @@ pub(crate) struct FirstStated<A: ForIRI, O> {
     first: FirstOfEach<A>,
 }
 
-/// The annotations an ontology was given of itself: of those given in order,
-/// it holds each but one equal to an annotation given before, once every
-/// `xsd:string` literal is read as untyped, and one with the property and the
-/// value of an annotation held, whatever annotations each carries of its own.
+/// Of the annotations an ontology is given of itself, in order, those it holds
+/// when nothing else chooses: each but one equal to an annotation given before,
+/// once every `xsd:string` literal is read as untyped, and one with the
+/// property and the value of an annotation held, whatever annotations each
+/// carries of its own.
+pub(crate) fn first_of_each<A: ForIRI>(added: Vec<Annotation<A>>) -> Vec<Annotation<A>> {
+    let mut first = FirstOfEach::default();
+    added.into_iter().filter(|a| first.holds(a)).collect()
+}
+
+/// The annotations an ontology was given of itself, for [`first_of_each`].
 struct FirstOfEach<A: ForIRI> {
     /// The untyped form of every one given, held or not.
     given: HashSet<AnnotatedComponent<A>>,
@@ -503,6 +510,24 @@ Annotations: rdfs:comment "c", rdfs:comment "d"
         let (o, _): (SetOntology<RcStr>, _) =
             crate::io::omn::reader::read(omn.as_bytes(), cfg()).unwrap();
         assert_eq!(held_by(&o), second, "Manchester syntax");
+
+        let rdf = r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:owl="http://www.w3.org/2002/07/owl#"
+     xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+     xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#">
+    <owl:Ontology rdf:about="http://example.org/o">
+        <rdfs:comment>c</rdfs:comment>
+        <rdfs:comment>d</rdfs:comment>
+    </owl:Ontology>
+</rdf:RDF>"#;
+        let config = crate::io::RDFParserConfiguration {
+            common: cfg(),
+            format: None,
+        };
+        let (o, _): (crate::io::rdf::reader::ConcreteRcRDFOntology, _) =
+            crate::io::rdf::reader::read(&mut rdf.as_bytes(), config).unwrap();
+        let o: SetOntology<RcStr> = o.into();
+        assert_eq!(held_by(&o).len(), 1, "RDF/XML");
     }
 
     #[test]
