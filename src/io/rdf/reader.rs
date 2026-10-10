@@ -2057,8 +2057,11 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                     }
                 }
                 [Term::Iri(p), Term::OWL(VOWL::InverseOf), Term::Iri(r)] => Ok(Some(
-                    InverseObjectProperties(ObjectProperty(p.clone()), ObjectProperty(r.clone()))
-                        .into(),
+                    InverseObjectProperties(
+                        ObjectProperty(p.clone()).into(),
+                        ObjectProperty(r.clone()).into(),
+                    )
+                    .into(),
                 )),
                 [
                     pr,
@@ -2401,7 +2404,7 @@ impl<A: ForIRI, AA: ForIndex<A>, O: RDFOntology<A, AA>, B: AsRef<Build<A>>>
                         Atom::DataPropertyAtom {
                             pred: self.convert_to_dp(pred)?,
                             args: (
-                                self.retrieve_to_dargument(arg1)?,
+                                self.retrieve_to_iargument(arg1)?,
                                 self.retrieve_to_dargument(arg2)?,
                             )
                         }

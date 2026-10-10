@@ -192,8 +192,8 @@ impl<A: ForIRI> FromPair<A> for AnnotatedComponent<A> {
             Rule::InverseObjectProperties => {
                 let mut inner = pair.into_inner();
                 let annotations = FromPair::from_pair(inner.next().unwrap(), ctx)?;
-                let r1 = ObjectProperty::from_pair(inner.next().unwrap(), ctx)?;
-                let r2 = ObjectProperty::from_pair(inner.next().unwrap(), ctx)?;
+                let r1 = ObjectPropertyExpression::from_pair(inner.next().unwrap(), ctx)?;
+                let r2 = ObjectPropertyExpression::from_pair(inner.next().unwrap(), ctx)?;
                 Ok(Self::new(InverseObjectProperties(r1, r2), annotations))
             }
             Rule::FunctionalObjectProperty => {
@@ -548,9 +548,9 @@ impl<A: ForIRI> FromPair<A> for Atom<A> {
             Rule::AtomDataProperty => {
                 let mut pairs = inner.into_inner();
                 let pred = FromPair::from_pair(pairs.next().unwrap(), ctx)?;
-                let d1 = DArgument::from_pair(pairs.next().unwrap(), ctx)?;
-                let d2 = DArgument::from_pair(pairs.next().unwrap(), ctx)?;
-                let args = (d1, d2);
+                let i = IArgument::from_pair(pairs.next().unwrap(), ctx)?;
+                let d = DArgument::from_pair(pairs.next().unwrap(), ctx)?;
+                let args = (i, d);
                 Ok(Atom::DataPropertyAtom { pred, args })
             }
             Rule::AtomBuiltIn => {
@@ -1315,7 +1315,7 @@ mod tests {
         let expected = Atom::DataPropertyAtom {
             pred: build.data_property("https://example.com/d"),
             args: (
-                DArgument::Variable(build.variable("https://example.com/x")),
+                IArgument::Variable(build.variable("https://example.com/x")),
                 DArgument::Literal(Literal::Simple {
                     literal: String::from("Literal String"),
                 }),

@@ -1609,7 +1609,10 @@ fn insert_object_property_frame<A: ForIRI, O: MutableOntology<A>>(
                         (Some(subj_iri), ObjectPropertyExpression::ObjectProperty(p)) => {
                             ont.insert(AnnotatedComponent {
                                 component: Component::InverseObjectProperties(
-                                    InverseObjectProperties(ObjectProperty(subj_iri.clone()), p),
+                                    InverseObjectProperties(
+                                        ObjectProperty(subj_iri.clone()).into(),
+                                        p.into(),
+                                    ),
                                 ),
                                 ann: item_ann,
                             });
@@ -1845,7 +1848,7 @@ fn parse_swrl_atom<A: ForIRI>(atom: Pair<Rule>, ctx: &Context<'_, A>) -> Result<
                 } else if second_is_lit || pred_iri.as_ref().is_some_and(|i| ctx.is_data_prop(i)) {
                     Ok(Atom::DataPropertyAtom {
                         pred: DataProperty(bare()?),
-                        args: (swrl_darg(&kinds[0])?, swrl_darg(&kinds[1])?),
+                        args: (swrl_iarg(&kinds[0])?, swrl_darg(&kinds[1])?),
                     })
                 } else {
                     Ok(Atom::ObjectPropertyAtom {
@@ -3047,8 +3050,8 @@ mod tests {
         o.insert(AsymmetricObjectProperty(ope("http://ex/r")));
         o.insert(TransitiveObjectProperty(ope("http://ex/r")));
         o.insert(InverseObjectProperties(
-            b.object_property("http://ex/r"),
-            b.object_property("http://ex/t"),
+            b.object_property("http://ex/r").into(),
+            b.object_property("http://ex/t").into(),
         ));
 
         let amo: TestOnt = o.clone().into();
@@ -3476,8 +3479,8 @@ mod tests {
         });
         o.insert(FunctionalObjectProperty(ope("http://ex/r")));
         o.insert(InverseObjectProperties(
-            b.object_property("http://ex/r"),
-            b.object_property("http://ex/t"),
+            b.object_property("http://ex/r").into(),
+            b.object_property("http://ex/t").into(),
         ));
         // data property axioms
         o.insert(DataPropertyRange {

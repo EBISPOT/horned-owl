@@ -516,10 +516,15 @@ fn clause_lines<A: ForIRI>(
             }
         }
         Component::InverseObjectProperties(a) => {
-            vec![(
-                a.0.0.as_ref().to_string(),
-                format!("inverse_of: {}", cz(a.1.0.as_ref())),
-            )]
+            // OBO `inverse_of:` is only defined between named properties; an
+            // inverse *expression* on either side has no OBO form, so skip it.
+            match (a.0.as_property(), a.1.as_property()) {
+                (Some(p0), Some(p1)) => vec![(
+                    p0.0.as_ref().to_string(),
+                    format!("inverse_of: {}", cz(p1.0.as_ref())),
+                )],
+                _ => vec![],
+            }
         }
         Component::ObjectPropertyDomain(d) => op_class(&d.ope, &d.ce, "domain", cz),
         Component::ObjectPropertyRange(r) => op_class(&r.ope, &r.ce, "range", cz),

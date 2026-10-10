@@ -315,8 +315,8 @@ impl<A: ForIRI, V: Visit<A>> Walk<A, V> {
 
     pub fn inverse_object_properties(&mut self, e: &InverseObjectProperties<A>) {
         self.0.visit_inverse_object_properties(e);
-        self.object_property(&e.0);
-        self.object_property(&e.1);
+        self.object_property_expression(&e.0);
+        self.object_property_expression(&e.1);
     }
 
     pub fn object_property_domain(&mut self, e: &ObjectPropertyDomain<A>) {
@@ -500,7 +500,7 @@ impl<A: ForIRI, V: Visit<A>> Walk<A, V> {
             }
             Atom::DataPropertyAtom { pred, args } => {
                 self.data_property(pred);
-                self.darg(&args.0);
+                self.iarg(&args.0);
                 self.darg(&args.1);
             }
             Atom::DataRangeAtom { pred, arg } => {

@@ -182,6 +182,7 @@ derive_tuple2!(A, Class<A>, Vec<ClassExpression<A>>);
 derive_tuple2!(A, Datatype<A>, DataRange<A>);
 derive_tuple2!(A, ClassExpression<A>, Individual<A>);
 derive_tuple2!(A, ObjectProperty<A>, ObjectProperty<A>);
+derive_tuple2!(A, ObjectPropertyExpression<A>, ObjectPropertyExpression<A>);
 derive_tuple2!(A, ObjectPropertyExpression<A>, ClassExpression<A>);
 derive_tuple2!(A, AnnotationProperty<A>, AnnotationValue<A>);
 derive_tuple2!(A, AnnotationProperty<A>, IRI<A>);
@@ -596,9 +597,10 @@ impl<A: ForIRI> Display for Functional<'_, Atom<A>, A> {
             DataPropertyAtom { pred, args } => {
                 write!(
                     f,
-                    "DataPropertyAtom({} {})",
+                    "DataPropertyAtom({} {} {})",
                     Functional(&pred, self.1, None),
-                    Functional(&(&args.0, &args.1), self.1, None),
+                    Functional(&args.0, self.1, None),
+                    Functional(&args.1, self.1, None),
                 )
             }
             DataRangeAtom { pred, arg } => {

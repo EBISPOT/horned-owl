@@ -59,11 +59,11 @@
 //! - Rule 3:
 //! ```
 //! # use horned_owl::model::*;
-//! // InverseObjectProperty(ObjectProperty, ObjectProperty)
+//! // InverseObjectProperties(ObjectPropertyExpression, ObjectPropertyExpression)
 //! let b = Build::new_rc();
 //! let iop = InverseObjectProperties
-//!             (b.object_property("http://www.example.com/op1"),
-//!              b.object_property("http://www.example.com/op2"));
+//!             (b.object_property("http://www.example.com/op1").into(),
+//!              b.object_property("http://www.example.com/op2").into());
 //! ```
 //! - Rule 4:
 //! ```
@@ -89,6 +89,7 @@
 //!     to: b.named_individual("http://www.example.com/i2").into(),
 //! };
 //! ```
+use rustc_hash::FxHashSet;
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -170,6 +171,25 @@ impl<A: ForIRI> IRI<A> {
     pub fn underlying(&self) -> A {
         self.0.clone()
     }
+
+    /// Whether this IRI is absolute, as [`is_absolute_iri`] judges it.
+    pub fn is_absolute(&self) -> bool {
+        is_absolute_iri(self.as_ref())
+    }
+}
+
+/// Whether `iri` is absolute: it has a colon, and every character before its
+/// first colon is a letter, a digit, `.`, `+` or `-`. A letter or a digit is
+/// one as Java's `Character` judges a UTF-16 code unit, so a character beyond
+/// the Basic Multilingual Plane is neither; an IRI that starts with its colon
+/// is absolute.
+pub fn is_absolute_iri(iri: &str) -> bool {
+    let Some(colon) = iri.find(':') else {
+        return false;
+    };
+    iri[..colon].encode_utf16().all(|unit| {
+        crate::java_char::is_letter_or_digit(unit) || matches!(unit, 0x2E | 0x2B | 0x2D)
+    })
 }
 
 impl<A: ForIRI> Deref for IRI<A> {
@@ -277,18 +297,23 @@ impl<A: ForIRI> IRI<A> {
 /// without consequences except for increased memory use.
 #[derive(Debug, Default)]
 pub struct Build<A>(
-    RefCell<BTreeSet<IRI<A>>>,
-    RefCell<BTreeSet<AnonymousIndividual<A>>>,
+    RefCell<FxHashSet<IRI<A>>>,
+    RefCell<FxHashSet<AnonymousIndividual<A>>>,
     // Last anon individual
     RefCell<i64>,
+    // The id the next blank node of a document being parsed takes, when that
+    // document's blank nodes are being numbered. `None` leaves a parse's own
+    // labels alone.
+    RefCell<Option<i64>>,
 );
 
 impl<A: ForIRI> Build<A> {
     pub fn new() -> Build<A> {
         Build(
-            RefCell::new(BTreeSet::new()),
-            RefCell::new(BTreeSet::new()),
+            RefCell::new(FxHashSet::default()),
+            RefCell::new(FxHashSet::default()),
             RefCell::new(0),
+            RefCell::new(None),
         )
     }
 
@@ -307,6 +332,51 @@ impl<A: ForIRI> Build<A> {
     pub fn anon_renumbered(&self) -> AnonymousIndividual<A> {
         self.2.replace_with(|&mut old| old + 1);
         self.anon(format!("anon{:06}", self.2.borrow()))
+    }
+
+    /// Number the blank nodes of documents parsed with this `Build` from `n`.
+    ///
+    /// A blank node is then known by the id it is given here — `genid<n>`,
+    /// counting up in the order a parse first meets each node — and every
+    /// document parsed with this `Build` continues the same count, so nodes from
+    /// two documents merged together keep their separate identities.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use horned_owl::model::*;
+    /// let b = Build::new_rc();
+    /// b.set_bnode_base(2_147_483_648);
+    /// assert_eq!("genid2147483648", b.next_bnode_label().unwrap());
+    /// assert_eq!("genid2147483649", b.next_bnode_label().unwrap());
+    /// assert_eq!(2_147_483_650, b.bnode_base().unwrap());
+    /// ```
+    pub fn set_bnode_base(&self, n: i64) {
+        self.3.replace(Some(n));
+    }
+
+    /// How far the blank-node count has got, or `None` when documents parsed
+    /// with this `Build` keep their own labels.
+    pub fn bnode_base(&self) -> Option<i64> {
+        *self.3.borrow()
+    }
+
+    /// The label for the next blank node a parse meets, taking one value from
+    /// the count. `None` when numbering is off.
+    pub fn next_bnode_label(&self) -> Option<String> {
+        let n = { (*self.3.borrow())? };
+        self.3.replace(Some(n + 1));
+        Some(format!("genid{n}"))
+    }
+
+    /// Take `n` ids from the count without naming anything with them — the ids
+    /// a document's own blank nodes hold, which the individuals among them are
+    /// numbered after.
+    pub fn skip_bnode_labels(&self, n: usize) {
+        let base = { *self.3.borrow() };
+        if let Some(base) = base {
+            self.3.replace(Some(base + n as i64));
+        }
     }
 
     /// Constructs a new `AnonymousIndividual`
@@ -1406,7 +1476,7 @@ components! {
     /// `s` are transitive, then `a r b` implies `b r a`.
     ///
     /// See also: [Property Characteristics](https://www.w3.org/TR/2012/REC-owl2-primer-20121211/#Property_Characteristics)
-    Axiom InverseObjectProperties(ObjectProperty<A>,ObjectProperty<A>),
+    Axiom InverseObjectProperties(ObjectPropertyExpression<A>,ObjectPropertyExpression<A>),
 
     /// The domain of the object property.
     ///
@@ -1721,9 +1791,14 @@ pub struct Annotation<A> {
 /// The value of an annotation
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AnnotationValue<A> {
-    Literal(Literal<A>),
+    // Variant order matches OWLAPI's annotation-value type index (IRI 0 <
+    // anonymous individual 1007 < literal 4008), so the derived `Ord` — used to
+    // order annotations in the functional-syntax writer — reproduces OWLAPI's
+    // `compareTo`. Reordering only affects sort/`BTreeSet` iteration order, not
+    // equality or construction (variants are built by name).
     IRI(IRI<A>),
     AnonymousIndividual(AnonymousIndividual<A>),
+    Literal(Literal<A>),
 }
 
 impl<A: ForIRI> From<Literal<A>> for AnnotationValue<A> {
@@ -2059,7 +2134,7 @@ pub enum Atom<A> {
     },
     DataPropertyAtom {
         pred: DataProperty<A>,
-        args: (DArgument<A>, DArgument<A>),
+        args: (IArgument<A>, DArgument<A>),
     },
     DataRangeAtom {
         pred: DataRange<A>,
@@ -2230,6 +2305,33 @@ mod test {
         let iri = build.iri("http://www.example.com");
 
         assert_eq!(String::from(iri), "http://www.example.com");
+    }
+
+    #[test]
+    fn absolute_iris() {
+        // Letters and decimal digits of any script in the Basic Multilingual
+        // Plane, `.`, `+` and `-` may come before the first colon.
+        for iri in
+            ["http://a", "urn:x", ":c", "1a.b+c-d:e", "\u{AA}:x", "\u{660}:x", "\u{E9}t\u{E9}:x"]
+        {
+            assert!(is_absolute_iri(iri), "{iri}");
+        }
+        // A superscript digit, a letter number and a letter beyond the plane
+        // are neither letters nor digits.
+        for iri in [
+            "a.owl#C",
+            "",
+            "a/b:c",
+            "a b:c",
+            "_:b",
+            "{x}:y",
+            "\u{B2}:x",
+            "\u{2160}:x",
+            "\u{1D49C}:x",
+        ] {
+            assert!(!is_absolute_iri(iri), "{iri}");
+        }
+        assert!(Build::new_rc().iri("http://a").is_absolute());
     }
 
     #[test]

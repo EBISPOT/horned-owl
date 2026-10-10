@@ -1657,9 +1657,14 @@ render_to_vec! {
 render! {
     InverseObjectProperties, self, f, ng, PTriple,
     {
+        // Either side may be an inverse expression (rendered as a bnode), so
+        // render each ObjectPropertyExpression to a node rather than assuming a
+        // named property.
+        let node_a: PNamedOrBlankNode<_> = self.0.render(f, ng)?;
+        let node_b: PTerm<_> = self.1.render(f, ng)?.into();
         Ok(
             triple!(
-                f, ng.escaped(&self.0.0), ng.nn(OWL::InverseOf), ng.escaped(&self.1.0)
+                f, node_a, ng.nn(OWL::InverseOf), node_b
             )
         )
     }
