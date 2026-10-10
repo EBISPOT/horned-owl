@@ -314,9 +314,12 @@ impl<A: AsRef<str>> PTriple<A> {
         self.predicate.iri.as_ref() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest"
     }
 
+    /// The last cell of a list: its `rdf:rest` is `rdf:nil`. Another statement
+    /// whose object is `rdf:nil` names an empty list and is no cell.
     pub fn is_collection_end(&self) -> bool {
         if let PTerm::NamedNode(nn) = &self.object {
-            nn.iri.as_ref() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"
+            self.is_collection_rest()
+                && nn.iri.as_ref() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"
         } else {
             false
         }
@@ -465,6 +468,19 @@ impl<A: AsRef<str> + Clone> PTripleSeq<A> {
             todo!("This shouldn't happen")
         }
         seq
+    }
+
+    /// Is every member of this collection a NAMED node? Such a list can be
+    /// rendered more than once without consuming anything else from the chunk,
+    /// which is what makes inlining a shared list safe.
+    pub fn all_named_members(&self) -> bool {
+        self.list_seq.iter().all(|(_, t, _)| match t {
+            Some(PTriple {
+                object: PTerm::NamedNode(_),
+                ..
+            }) => true,
+            _ => false,
+        })
     }
 
     pub fn has_literal(&self) -> bool {
@@ -830,6 +846,25 @@ where
     fn object_count(&self, bn: &PBlankNode<A>) -> usize {
         self.bnode_object_count.get(bn).copied().unwrap_or(0)
     }
+
+    /// A CLONE of `bn`'s collection, leaving it in the store for the next
+    /// reference. Only yields a pure sequence — a subject that also carries
+    /// ordinary triples is left to the destructive path.
+    fn peek_seq(&self, bn: &PBlankNode<A>) -> Option<PTripleSeq<A>> {
+        let key = PNamedOrBlankNode::BlankNode(bn.clone());
+        match self.store.get(&key) {
+            Some((None, Some(seq))) => Some(seq.clone()),
+            _ => None,
+        }
+    }
+
+    /// Record that one of `bn`'s object references has been rendered, so the
+    /// LAST one takes the destructive path and empties the store.
+    fn dec_object_count(&mut self, bn: &PBlankNode<A>) {
+        if let Some(c) = self.bnode_object_count.get_mut(bn) {
+            *c = c.saturating_sub(1);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1013,13 +1048,7 @@ where
         let description_open = if let Some(typ) = mt.find_typed() {
             if let PTerm::NamedNode(nn) = &typ.object {
                 triples_rendered.push(typ);
-                let mut bs = self.bytes_start_iri(nn);
-                if let PNamedOrBlankNode::BlankNode(bn) = &typ.subject
-                    && chunk.object_count(bn) > 1
-                {
-                    bs.push_attribute(("rdf:nodeID", Self::nodeid_attr_value(bn)));
-                }
-                Some(bs)
+                Some(self.bytes_start_iri(nn))
             } else {
                 None
             }
@@ -1034,9 +1063,12 @@ where
             PNamedOrBlankNode::NamedNode(n) => {
                 description_open.push_attribute(("rdf:about", n.iri.as_ref()))
             }
-            PNamedOrBlankNode::BlankNode(_) => {
-                // Empty
+            // A blank node more than one statement refers to is named, and
+            // each of them refers to it by that name.
+            PNamedOrBlankNode::BlankNode(bn) if chunk.object_count(bn) > 1 => {
+                description_open.push_attribute(("rdf:nodeID", Self::nodeid_attr_value(bn)));
             }
+            PNamedOrBlankNode::BlankNode(_) => {}
         }
 
         // TODO: Shares lots of code with format_property
@@ -1114,6 +1146,28 @@ where
                     .map_err(map_err)?;
             }
             PTerm::BlankNode(bn) => {
+                // A collection referenced MORE THAN ONCE is rendered inline at
+                // every reference, exactly as ROBOT/OWLAPI does. Otherwise both
+                // sites fell through to a bare `rdf:nodeID` and the list was
+                // emitted nowhere, so re-reading the document LOST the axiom:
+                // RO's eight annotated property chains (whose list node is also
+                // the `owl:annotatedTarget` of an `owl:Axiom` reification)
+                // vanished on every RDF/XML round trip, 160 chains in and 152
+                // out. Restricted to all-named-member lists, which can be
+                // rendered repeatedly without consuming anything else from the
+                // chunk.
+                if chunk.object_count(bn) > 1 {
+                    if let Some(seq) = chunk.peek_seq(bn) {
+                        if !seq.has_literal() && seq.all_named_members() {
+                            chunk.dec_object_count(bn);
+                            property_open.push_attribute(("rdf:parseType", "Collection"));
+                            self.write_start(Event::Start(property_open))
+                                .map_err(map_err)?;
+                            self.format_seq_shorthand(&seq, chunk)?;
+                            return Ok(());
+                        }
+                    }
+                }
                 if chunk.object_count(bn) == 1 {
                     match chunk.take_subject(bn) {
                         (None, Some(seq)) => {
@@ -1324,6 +1378,9 @@ where
     }
 
     pub fn format_chunk(&mut self, mut chunk: PChunk<A>) -> Result<(), io::Error> {
+        // How many blank nodes have been put back in a row, each to be nested
+        // where it is the object.
+        let mut waiting = 0;
         loop {
             let optet = chunk.pop_front();
             if let Some(et) = optet {
@@ -1331,12 +1388,21 @@ where
                 if let PNamedOrBlankNode::BlankNode(bn) = et.subject() {
                     // And there is later triple which will reference this as an object
                     if chunk.object_count(bn) == 1 {
-                        // Don't render it here, but later
-                        chunk.push_back(et);
-                        continue;
+                        // Don't render it here, but later -- unless every node
+                        // left has been put back since anything was rendered.
+                        // Then they are each other's objects and no other
+                        // node's, so this one is rendered here, under a name
+                        // the node that refers to it uses.
+                        if waiting <= chunk.queue.len() {
+                            chunk.push_back(et);
+                            waiting += 1;
+                            continue;
+                        }
+                        *chunk.bnode_object_count.entry(bn.clone()).or_default() += 1;
                     }
                 }
 
+                waiting = 0;
                 self.format_removed_expanded(&et, &mut chunk)?;
             } else {
                 break;
@@ -2263,5 +2329,56 @@ r###"<?xml version="1.0" encoding="UTF-8"?>
             reparsed.err()
         );
         assert_eq!(reparsed.unwrap().len(), 2);
+    }
+
+    /// Blank nodes that are each other's objects, and no other node's, are
+    /// all written: one of them at the top level under a name the node
+    /// referring to it uses, the rest nested in it.
+    #[test]
+    fn blank_nodes_in_a_cycle_are_written() {
+        let xml = from_nt_prefix(
+            r###"_:a <http://www.w3.org/2002/07/owl#sameAs> _:b .
+_:b <http://www.example.com/iri#p> _:a .
+_:b <http://www.example.com/iri#q> "b" .
+"###,
+            indexmap![
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#" => "rdf",
+                "http://www.w3.org/2002/07/owl#" => "owl"
+            ],
+        )
+        .unwrap();
+        let reparsed: Vec<oxrdf::Triple> = RdfParser::from_format(oxrdfio::RdfFormat::RdfXml)
+            .for_reader(xml.as_bytes())
+            .map(|q| q.map(oxrdf::Triple::from))
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|e| panic!("generated XML was not re-parseable:\n{xml}\nerror: {e}"));
+        assert_eq!(reparsed.len(), 3, "{xml}");
+        let object_of = |s: &oxrdf::NamedOrBlankNode, p: &str| {
+            reparsed
+                .iter()
+                .find(|t| &t.subject == s && t.predicate.as_str() == p)
+                .map(|t| t.object.clone())
+                .unwrap_or_else(|| panic!("no {p} statement of {s}:\n{xml}"))
+        };
+        let a = reparsed
+            .iter()
+            .find(|t| t.predicate.as_str() == "http://www.w3.org/2002/07/owl#sameAs")
+            .map(|t| t.subject.clone())
+            .unwrap();
+        let oxrdf::Term::BlankNode(b) = object_of(&a, "http://www.w3.org/2002/07/owl#sameAs")
+        else {
+            panic!("owl:sameAs names no blank node:\n{xml}")
+        };
+        let b = oxrdf::NamedOrBlankNode::BlankNode(b);
+        assert_eq!(
+            object_of(&b, "http://www.example.com/iri#p"),
+            a.clone().into(),
+            "{xml}"
+        );
+        assert_eq!(
+            object_of(&b, "http://www.example.com/iri#q"),
+            oxrdf::Literal::new_simple_literal("b").into(),
+            "{xml}"
+        );
     }
 }

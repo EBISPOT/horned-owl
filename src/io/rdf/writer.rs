@@ -4,10 +4,11 @@ use crate::{
     io::{StreamComponent, StreamOntology},
     model::*,
     ontology::component_mapped::ComponentMappedOntology,
-    vocab::{OWL, RDF, RDFS, SWRL, Vocab, XSD},
+    vocab::{Namespace, OWL, RDF, RDFS, SWRL, Vocab, XSD},
 };
 
 use crate::ontology::indexed::ForIndex;
+use crate::visitor::immutable::{Visit, Walk};
 
 use curie::PrefixMapping;
 use indexmap::indexmap;
@@ -71,14 +72,21 @@ pub fn write_with_config<A: ForIRI, AA: ForIndex<A>, W: Write>(
     mapping: Option<&PrefixMapping>,
     config: RDFWriterConfiguration,
 ) -> Result<W, HornedError> {
-    let mut p = indexmap![
+    // key = namespace IRI, value = prefix name (what pretty_rdf's config wants).
+    let mut p: indexmap::IndexMap<String, String> = indexmap![
                     "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string() => "rdf".to_string(),
                     "http://www.w3.org/2002/07/owl#".to_string() => "owl".to_string(),
                     "http://www.w3.org/2003/11/swrl#".to_string() => "swrl".to_string()
     ];
     if let Some(mapping) = mapping {
-        for (prefix, iri) in mapping.mappings() {
-            p.insert(iri.clone(), prefix.clone());
+        for (name, ns) in mapping.mappings() {
+            if name.is_empty() {
+                continue; // the default `xmlns=` is config.base's job, not here
+            }
+            // Keep the builtin binding for a namespace; add every other document
+            // prefix. First declaration of a namespace wins (matches OWLAPI's
+            // shortening choice for a namespace carrying multiple aliases).
+            p.entry(ns.to_string()).or_insert_with(|| name.to_string());
         }
     }
 
@@ -561,8 +569,11 @@ fn render_vec_subject<
         }
         rest = Some(bn.clone())
     }
-    // Panic if Vec is zero length!
-    Ok(rest.unwrap())
+    // An empty list is rdf:nil.
+    Ok(match rest {
+        Some(r) => r,
+        None => ng.nn(RDF::Nil).into(),
+    })
 }
 
 // TODO This code is an almost exact duplicate of render_vec_slice. Why do I need both?
@@ -588,8 +599,11 @@ where
             }
             rest = Some(bn.clone().into())
         }
-        // Panic if Vec is zero length!
-        Ok(rest.unwrap())
+        // An empty list is rdf:nil.
+        Ok(match rest {
+            Some(r) => r,
+            None => ng.nn(RDF::Nil).into(),
+        })
     }
 }
 
@@ -607,30 +621,30 @@ impl<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W>, W: Write> Render<A, F, (
     for &ComponentMappedOntology<A, AA>
 {
     fn render(&self, f: &mut F, ng: &mut NodeGenerator<A>) -> Result<(), HornedError> {
+        // The ontology is its IRI, or a blank node when it has none; either way
+        // it carries its imports and its annotations.
         let ont_id = self.i().the_ontology_id_or_default();
-        if let Some(iri) = &ont_id.iri {
-            let node_iri = ng.escaped(iri);
-            triples!(f, node_iri.clone(), ng.nn(RDF::Type), ng.nn(OWL::Ontology));
+        let ont_node: PNamedOrBlankNode<A> = match &ont_id.iri {
+            Some(iri) => ng.escaped(iri).into(),
+            None => ng.bn(),
+        };
+        triples!(f, ont_node.clone(), ng.nn(RDF::Type), ng.nn(OWL::Ontology));
 
-            if let Some(viri) = &ont_id.viri {
-                triples!(
-                    f,
-                    node_iri.clone(),
-                    ng.nn(OWL::VersionIRI),
-                    ng.escaped(viri)
-                );
-            }
+        if let (Some(iri), Some(viri)) = (&ont_id.iri, &ont_id.viri) {
+            triples!(f, ng.escaped(iri), ng.nn(OWL::VersionIRI), ng.escaped(viri));
+        }
 
-            let imp = self.i().import();
-            for i in imp {
-                triples!(f, node_iri.clone(), ng.nn(OWL::Imports), ng.escaped(&i.0));
-            }
+        let imp = self.i().import();
+        for i in imp {
+            triples!(f, ont_node.clone(), ng.nn(OWL::Imports), ng.escaped(&i.0));
+        }
 
-            let oa = self.i().ontology_annotation();
-            ng.keep_this_bn(node_iri.into());
-            for a in oa {
-                a.0.render(f, ng)?;
-            }
+        // Each annotation is of the ontology, whatever node the annotations of
+        // the one before it were stated of.
+        let oa = self.i().ontology_annotation();
+        for a in oa {
+            ng.keep_this_bn(ont_node.clone());
+            a.0.render(f, ng)?;
         }
 
         for cmp in self.i().iter() {
@@ -638,7 +652,187 @@ impl<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W>, W: Write> Render<A, F, (
             cmp.render(f, ng)?;
         }
 
+        // Emitted last so that entities which already occur as a subject keep
+        // their position in the document and merely gain their `rdf:type`
+        // property; only entities that appear nowhere as a subject (mentioned
+        // solely inside a class expression, say) are appended as fresh blocks.
+        for (iri, kind) in undeclared_signature(self, ng.lax) {
+            let ty = match kind {
+                NamedOWLEntityKind::Class => ng.nn(OWL::Class),
+                NamedOWLEntityKind::Datatype => ng.nn(RDFS::Datatype),
+                NamedOWLEntityKind::ObjectProperty => ng.nn(OWL::ObjectProperty),
+                NamedOWLEntityKind::DataProperty => ng.nn(OWL::DatatypeProperty),
+                NamedOWLEntityKind::AnnotationProperty => ng.nn(OWL::AnnotationProperty),
+                NamedOWLEntityKind::NamedIndividual => ng.nn(OWL::NamedIndividual),
+            };
+            triples!(f, &iri, ng.nn(RDF::Type), ty);
+        }
+
         Ok(())
+    }
+}
+
+/// Gathers an ontology's entity signature alongside the entities that a
+/// `Declaration` component already types, so the writer can emit the difference
+/// (see [`undeclared_signature`]).
+struct SignatureCollect<A: ForIRI> {
+    /// Every (entity, kind) pair mentioned anywhere, in first-encounter order.
+    used: Vec<(IRI<A>, NamedOWLEntityKind)>,
+    seen: HashSet<(IRI<A>, NamedOWLEntityKind)>,
+    /// The subset carrying an explicit `Declaration`. Keyed on the pair rather
+    /// than the IRI alone so that punning still works: an IRI declared as a
+    /// class but *used* as an object property needs both type triples.
+    declared: HashSet<(IRI<A>, NamedOWLEntityKind)>,
+}
+
+impl<A: ForIRI> SignatureCollect<A> {
+    fn new() -> Self {
+        SignatureCollect {
+            used: vec![],
+            seen: HashSet::new(),
+            declared: HashSet::new(),
+        }
+    }
+
+    fn used(&mut self, iri: &IRI<A>, kind: NamedOWLEntityKind) {
+        let e = (iri.clone(), kind);
+        if self.seen.insert(e.clone()) {
+            self.used.push(e);
+        }
+    }
+}
+
+impl<A: ForIRI> Visit<A> for SignatureCollect<A> {
+    fn visit_class(&mut self, e: &Class<A>) {
+        self.used(&e.0, NamedOWLEntityKind::Class)
+    }
+    fn visit_datatype(&mut self, e: &Datatype<A>) {
+        self.used(&e.0, NamedOWLEntityKind::Datatype)
+    }
+    fn visit_object_property(&mut self, e: &ObjectProperty<A>) {
+        self.used(&e.0, NamedOWLEntityKind::ObjectProperty)
+    }
+    fn visit_data_property(&mut self, e: &DataProperty<A>) {
+        self.used(&e.0, NamedOWLEntityKind::DataProperty)
+    }
+    fn visit_annotation_property(&mut self, e: &AnnotationProperty<A>) {
+        self.used(&e.0, NamedOWLEntityKind::AnnotationProperty)
+    }
+    fn visit_named_individual(&mut self, e: &NamedIndividual<A>) {
+        self.used(&e.0, NamedOWLEntityKind::NamedIndividual)
+    }
+
+    // `Walk` descends from each `Declare*` into the entity it declares, so the
+    // visits above already record these as *used*; here we note that they are
+    // also *declared*, and hence rendered by the `render_triple!` impls below.
+    fn visit_declare_class(&mut self, e: &DeclareClass<A>) {
+        self.declared
+            .insert(((e.0).0.clone(), NamedOWLEntityKind::Class));
+    }
+    fn visit_declare_datatype(&mut self, e: &DeclareDatatype<A>) {
+        self.declared
+            .insert(((e.0).0.clone(), NamedOWLEntityKind::Datatype));
+    }
+    fn visit_declare_object_property(&mut self, e: &DeclareObjectProperty<A>) {
+        self.declared
+            .insert(((e.0).0.clone(), NamedOWLEntityKind::ObjectProperty));
+    }
+    fn visit_declare_data_property(&mut self, e: &DeclareDataProperty<A>) {
+        self.declared
+            .insert(((e.0).0.clone(), NamedOWLEntityKind::DataProperty));
+    }
+    fn visit_declare_annotation_property(&mut self, e: &DeclareAnnotationProperty<A>) {
+        self.declared
+            .insert(((e.0).0.clone(), NamedOWLEntityKind::AnnotationProperty));
+    }
+    fn visit_declare_named_individual(&mut self, e: &DeclareNamedIndividual<A>) {
+        self.declared
+            .insert(((e.0).0.clone(), NamedOWLEntityKind::NamedIndividual));
+    }
+}
+
+/// True for IRIs in the OWL/RDF/RDFS/XSD/SWRL vocabularies, whose entity type is
+/// fixed by the specification rather than by the document (`owl:Thing`,
+/// `rdfs:label`, `xsd:string`, …). OWLAPI never writes a declaration triple for
+/// these, and neither do we — doing so would add `Declaration` axioms to every
+/// re-read of an otherwise unremarkable file.
+fn is_builtin_entity<A: ForIRI>(iri: &IRI<A>) -> bool {
+    let iri: &str = iri.as_ref();
+    [Namespace::OWL, Namespace::RDF, Namespace::RDFS, Namespace::XSD, Namespace::SWRL]
+        .iter()
+        .any(|ns| iri.starts_with(ns.as_ref()))
+}
+
+/// The entities an ontology *uses* but never `Declaration`s, paired with the
+/// entity kind their usage implies.
+///
+/// In RDF an entity's type survives only as its `rdf:type` triple, and the sole
+/// component that renders one is `Declaration`. OWL does not require a
+/// declaration, however: OWLAPI (hence ROBOT) infers an entity's kind from the
+/// axioms it occurs in, so functional syntax such as CL's
+/// `EquivalentClasses(obo:GO_0051932 ObjectIntersectionOf(…))` — with no
+/// `Declaration(Class(obo:GO_0051932))` anywhere in `cl-edit.owl` — is
+/// perfectly legal. Rendered with no type triple that subject came out as a
+/// bare `<rdf:Description rdf:about="…GO_0051932">`, leaving the reverse
+/// mapping nothing to work from: reading CL's `tmp/cl-preprocess.owl` back
+/// failed with "Unknown entity in equivalent class statement", i.e. we wrote a
+/// file we could not read, silently breaking the CL release build.
+///
+/// OWLAPI's RDF renderer avoids this by emitting a declaration triple for every
+/// entity in the ontology signature regardless of whether a `Declaration` axiom
+/// exists; restricting that to the undeclared ones yields exactly the same set
+/// of triples, since the declared ones are rendered by `render_triple!` anyway.
+fn undeclared_signature<A: ForIRI, AA: ForIndex<A>>(
+    ont: &ComponentMappedOntology<A, AA>,
+    lax: bool,
+) -> Vec<(IRI<A>, NamedOWLEntityKind)> {
+    let mut walk = Walk::new(SignatureCollect::new());
+    for cmp in ont.i().iter() {
+        let cmp: &AnnotatedComponent<A> = cmp.borrow();
+        // Strict mode writes nothing for a single-member n-ary axiom (see
+        // `members`), so an entity only such an axiom mentions is not in the
+        // written ontology's signature either.
+        if !lax && dropped_in_strict_mode(&cmp.component) {
+            continue;
+        }
+        // The annotated form, not just the component: annotation properties used
+        // only on an axiom annotation are part of the signature too.
+        walk.annotated_component(cmp);
+    }
+
+    let sig = walk.into_visit();
+    let SignatureCollect { used, declared, .. } = sig;
+    used.into_iter()
+        .filter(|e| !declared.contains(e) && !is_builtin_entity(&e.0))
+        .collect()
+}
+
+/// Whether the mapping of `c` is a node of its own, which its annotations are
+/// stated of: a rule, a negative assertion, and a disjointness or difference
+/// of other than two members.
+fn annotated_on_node<A: ForIRI>(c: &Component<A>) -> bool {
+    match c {
+        Component::Rule(_)
+        | Component::NegativeObjectPropertyAssertion(_)
+        | Component::NegativeDataPropertyAssertion(_) => true,
+        Component::DisjointClasses(d) => d.0.len() != 2,
+        Component::DisjointObjectProperties(d) => d.0.len() != 2,
+        Component::DisjointDataProperties(d) => d.0.len() != 2,
+        Component::DifferentIndividuals(d) => d.0.len() != 2,
+        _ => false,
+    }
+}
+
+/// Whether `members` writes nothing for `c` when the writer is not lax: a
+/// single-member `DisjointClasses`, `DisjointObjectProperties`,
+/// `DisjointDataProperties` or `DifferentIndividuals` (#214).
+fn dropped_in_strict_mode<A: ForIRI>(c: &Component<A>) -> bool {
+    match c {
+        Component::DisjointClasses(d) => d.0.len() == 1,
+        Component::DisjointObjectProperties(d) => d.0.len() == 1,
+        Component::DisjointDataProperties(d) => d.0.len() == 1,
+        Component::DifferentIndividuals(d) => d.0.len() == 1,
+        _ => false,
     }
 }
 
@@ -675,6 +869,24 @@ impl<A: ForIRI, F: RdfFormatter<A, W>, W: Write> Render<A, F, (), W> for Annotat
         };
 
         if !self.ann.is_empty() {
+            // An axiom stated by a node of its own carries its annotations on
+            // that node, its first triple's subject: a SWRL rule's `swrl:Imp`,
+            // a negative assertion's `owl:NegativePropertyAssertion`, and the
+            // `owl:AllDisjointClasses`, `owl:AllDisjointProperties` or
+            // `owl:AllDifferent` of a disjointness or difference that is not a
+            // pair. Reifying its triples one by one instead reads back as no
+            // axiom at all.
+            if annotated_on_node(&self.component) {
+                let first = match cmp {
+                    Annotatable::Main(t) => Some(t),
+                    Annotatable::Multiple(v) => v.into_iter().next(),
+                };
+                if let Some(t) = first {
+                    ng.keep_this_bn(t.subject);
+                    let _ = self.ann.render(f, ng);
+                }
+                return Ok(());
+            }
             match cmp {
                 Annotatable::Main(t) => {
                     r(t)?;
@@ -733,6 +945,8 @@ render! {
             );
             ng.keep_this_bn(ann_bn);
             self.ann.render(f, ng)?;
+            // The annotation after this one annotates what this one does.
+            ng.keep_this_bn(bn.clone());
         }
 
         Ok(triple!(f, bn, node_ap, obj))
@@ -1398,6 +1612,68 @@ fn data_cardinality<A: ForIRI, F: RdfFormatter<A, W>, W: Write>(
     ))
 }
 
+/// Object-property-expression component of a canonical sort key.
+fn ope_key<A: ForIRI>(o: &ObjectPropertyExpression<A>) -> String {
+    match o {
+        ObjectPropertyExpression::ObjectProperty(p) => format!("a{}", p.0),
+        ObjectPropertyExpression::InverseObjectProperty(p) => format!("b{}", p.0),
+    }
+}
+
+/// A canonical, order-independent sort key for a class expression, used to make
+/// the RDF rdf:List serialization of `ObjectIntersectionOf`/`ObjectUnionOf`
+/// deterministic (named classes first, then existentials/universals by
+/// property then filler). Mirrors the OWL API's class-expression ordering closely
+/// enough that order-sensitive SPARQL collection patterns match.
+fn ce_sort_key<A: ForIRI>(ce: &ClassExpression<A>) -> String {
+    use ClassExpression::*;
+    match ce {
+        Class(c) => format!("01\u{1}{}", c.0),
+        ObjectIntersectionOf(_) => "02".to_string(),
+        ObjectUnionOf(_) => "03".to_string(),
+        ObjectComplementOf(b) => format!("04\u{1}{}", ce_sort_key(b)),
+        ObjectOneOf(_) => "05".to_string(),
+        ObjectSomeValuesFrom { ope, bce } => {
+            format!("06\u{1}{}\u{1}{}", ope_key(ope), ce_sort_key(bce))
+        }
+        ObjectAllValuesFrom { ope, bce } => {
+            format!("07\u{1}{}\u{1}{}", ope_key(ope), ce_sort_key(bce))
+        }
+        ObjectHasValue { ope, .. } => format!("08\u{1}{}", ope_key(ope)),
+        ObjectHasSelf(ope) => format!("09\u{1}{}", ope_key(ope)),
+        ObjectMinCardinality { n, ope, bce } => {
+            format!(
+                "10\u{1}{:020}\u{1}{}\u{1}{}",
+                n,
+                ope_key(ope),
+                ce_sort_key(bce)
+            )
+        }
+        ObjectMaxCardinality { n, ope, bce } => {
+            format!(
+                "11\u{1}{:020}\u{1}{}\u{1}{}",
+                n,
+                ope_key(ope),
+                ce_sort_key(bce)
+            )
+        }
+        ObjectExactCardinality { n, ope, bce } => {
+            format!(
+                "12\u{1}{:020}\u{1}{}\u{1}{}",
+                n,
+                ope_key(ope),
+                ce_sort_key(bce)
+            )
+        }
+        DataSomeValuesFrom { dp, .. } => format!("13\u{1}{}", dp.0),
+        DataAllValuesFrom { dp, .. } => format!("14\u{1}{}", dp.0),
+        DataHasValue { dp, .. } => format!("15\u{1}{}", dp.0),
+        DataMinCardinality { dp, n, .. } => format!("16\u{1}{:020}\u{1}{}", n, dp.0),
+        DataMaxCardinality { dp, n, .. } => format!("17\u{1}{:020}\u{1}{}", n, dp.0),
+        DataExactCardinality { dp, n, .. } => format!("18\u{1}{:020}\u{1}{}", n, dp.0),
+    }
+}
+
 render_to_node! {
     ClassExpression, self, f, ng,
     {
@@ -1406,7 +1682,16 @@ render_to_node! {
                 Self::Class(cl) => ng.escaped(&cl.0).into(),
                 Self::ObjectIntersectionOf(v)=>{
                     let bn = ng.bn();
-                    let node_seq = render_vec_subject(v, f, ng)?;
+                    // Canonically order the operands (named classes first, then by
+                    // property/filler) so the emitted rdf:List is deterministic and
+                    // matches the OWL API's serialization. OWL intersection is
+                    // order-independent, but the rdf:List is order-SENSITIVE, and
+                    // SPARQL collection patterns (e.g. MONDO's cross-species
+                    // `intersectionOf ( genus restriction restriction )` inject)
+                    // only match the canonical order.
+                    let mut v = v.clone();
+                    v.sort_by(|a, b| ce_sort_key(a).cmp(&ce_sort_key(b)));
+                    let node_seq = render_vec_subject(&v, f, ng)?;
 
                     triples_to_node!(
                          f,
@@ -1416,7 +1701,9 @@ render_to_node! {
                 }
                 Self::ObjectUnionOf(v) => {
                     let bn = ng.bn();
-                    let node_seq = render_vec_subject(v, f, ng)?;
+                    let mut v = v.clone();
+                    v.sort_by(|a, b| ce_sort_key(a).cmp(&ce_sort_key(b)));
+                    let node_seq = render_vec_subject(&v, f, ng)?;
 
                     triples_to_node!(
                         f,
@@ -1627,8 +1914,16 @@ render_to_node! {
 render_to_vec! {
     DisjointClasses, self, f, ng,
     {
-        let pred = ng.nn(OWL::DisjointWith);
-        nary(f, ng, &self.0, pred)
+        // Per the OWL2 RDF mapping, two classes use `owl:disjointWith`
+        // while three or more require an `owl:AllDisjointClasses` node with
+        // an `owl:members` sequence. The previous `nary` rendering emitted a
+        // star of `owl:disjointWith` triples for n > 2, which is both
+        // semantically wrong (it omits the non-first pairs) and fails to
+        // round-trip back into a single n-ary axiom.
+        members(f, ng,
+                OWL::DisjointWith,
+                OWL::AllDisjointClasses,
+                &self.0)
     }
 }
 
@@ -1962,12 +2257,12 @@ render! {
 /// has one) is already fixed by the time it's passed in here, so there's
 /// nothing left for a prefix to configure.
 ///
-/// `OntologyID`/`Import`/`OntologyAnnotation` need the ontology's own IRI
-/// as the subject of their triples, which isn't part of the component
-/// itself -- the first `OntologyID` seen supplies it for every `Import`/
-/// `OntologyAnnotation` that follows, so `components` must yield its
-/// `OntologyID` before any of those (the same ordering `write` already
-/// guarantees).
+/// `Import`/`OntologyAnnotation` are stated of the ontology's node, which
+/// isn't part of the component itself: its IRI, or a blank node when it has
+/// none. The `OntologyID` names it for every `Import`/`OntologyAnnotation`
+/// that follows; one that comes before any `OntologyID` is of an ontology
+/// with no IRI. So `components` must yield an ontology's `OntologyID` before
+/// any of those (the same ordering `write` already guarantees).
 pub fn write_stream<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W>, W: Write>(
     formatter: F,
     components: impl StreamOntology<A, AA>,
@@ -1985,7 +2280,7 @@ pub fn write_stream_with_config<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W
         lax: config.lax,
         ..NodeGenerator::default()
     };
-    let mut ontology_iri: Option<IRI<A>> = None;
+    let mut ontology: Option<PNamedOrBlankNode<A>> = None;
 
     for item in components {
         let ac = match item? {
@@ -1995,8 +2290,8 @@ pub fn write_stream_with_config<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W
         let ac: &AnnotatedComponent<A> = ac.borrow();
 
         match &ac.component {
-            Component::OntologyID(id) => {
-                if let Some(iri) = &id.iri {
+            Component::OntologyID(id) => match &id.iri {
+                Some(iri) => {
                     let node_iri = ng.escaped(iri);
                     triples!(
                         formatter,
@@ -2007,29 +2302,25 @@ pub fn write_stream_with_config<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W
                     if let Some(viri) = &id.viri {
                         triples!(
                             formatter,
-                            node_iri,
+                            node_iri.clone(),
                             ng.nn(OWL::VersionIRI),
                             ng.escaped(viri)
                         );
                     }
-                    ontology_iri = Some(iri.clone());
+                    ontology = Some(node_iri.into());
                 }
-            }
+                None => {
+                    stream_ontology_node(&mut formatter, &mut ng, &mut ontology)?;
+                }
+            },
             Component::Import(imp) => {
-                if let Some(iri) = &ontology_iri {
-                    triples!(
-                        formatter,
-                        ng.escaped(iri),
-                        ng.nn(OWL::Imports),
-                        ng.escaped(&imp.0)
-                    );
-                }
+                let node = stream_ontology_node(&mut formatter, &mut ng, &mut ontology)?;
+                triples!(formatter, node, ng.nn(OWL::Imports), ng.escaped(&imp.0));
             }
             Component::OntologyAnnotation(oa) => {
-                if let Some(iri) = &ontology_iri {
-                    ng.keep_this_bn(ng.escaped(iri).into());
-                    oa.0.render(&mut formatter, &mut ng)?;
-                }
+                let node = stream_ontology_node(&mut formatter, &mut ng, &mut ontology)?;
+                ng.keep_this_bn(node);
+                oa.0.render(&mut formatter, &mut ng)?;
             }
             _ => {
                 ac.render(&mut formatter, &mut ng)?;
@@ -2038,6 +2329,27 @@ pub fn write_stream_with_config<A: ForIRI, AA: ForIndex<A>, F: RdfFormatter<A, W
     }
 
     Ok(formatter.finish()?)
+}
+
+/// The node of the ontology a stream states: the one its `OntologyID` named,
+/// or, when none has, a blank node typed `owl:Ontology` here.
+fn stream_ontology_node<A: ForIRI, F: RdfFormatter<A, W>, W: Write>(
+    formatter: &mut F,
+    ng: &mut NodeGenerator<A>,
+    ontology: &mut Option<PNamedOrBlankNode<A>>,
+) -> Result<PNamedOrBlankNode<A>, HornedError> {
+    if let Some(node) = ontology {
+        return Ok(node.clone());
+    }
+    let node = ng.bn();
+    triples!(
+        formatter,
+        node.clone(),
+        ng.nn(RDF::Type),
+        ng.nn(OWL::Ontology)
+    );
+    *ontology = Some(node.clone());
+    Ok(node)
 }
 
 #[cfg(test)]
@@ -2262,6 +2574,48 @@ mod test {
         );
     }
 
+    /// A stream's ontology with no IRI is a blank node, typed once, carrying
+    /// its imports and its annotations, whatever order they come in.
+    #[test]
+    fn write_stream_states_an_anonymous_ontology() {
+        let ofn = r#"Prefix(:=<http://example.org/t#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(
+Import(<http://example.org/other>)
+Annotation(Annotation(rdfs:comment "inner") rdfs:comment "a")
+Annotation(rdfs:label "b")
+Declaration(Class(:A))
+)"#;
+        let b = Build::new_rc();
+        let (ont, _): (SetOntology<RcStr>, _) = crate::io::ofn::reader::read(
+            &mut ofn.as_bytes(),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let items: Vec<crate::io::Result<StreamComponent<AnnotatedComponent<RcStr>>>> = ont
+            .iter()
+            .map(|ac| Ok(StreamComponent::Component(ac.clone())))
+            .collect();
+        let formatter = WriterQuadSerializerAdaptor::new(
+            RdfSerializer::from_format(oxrdfio::RdfFormat::NTriples).for_writer(Vec::new()),
+        );
+        let out = write_stream(formatter, items.into_iter()).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert_eq!(
+            text.matches("http://www.w3.org/2002/07/owl#Ontology>")
+                .count(),
+            1,
+            "{text}"
+        );
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ntriples_ok(&mut &out[..]).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> = ont
+            .iter()
+            .filter(|c| !matches!(c.component, Component::OntologyID(_)) && !back.contains(*c))
+            .collect();
+        assert!(lost.is_empty(), "lost: {lost:#?}\n{text}");
+    }
+
     /// `Prefix` items in the stream are ignored (the formatter's namespace
     /// table, if any, is already fixed) -- confirm a stream that includes
     /// one still writes and rereads correctly rather than erroring.
@@ -2482,7 +2836,7 @@ mod test {
         );
         // Should not panic; writes owl:AllDifferent with a single-element list (matching OWL-API behaviour)
         let out = write_to_rdf_formatter(&ont, formatter).unwrap();
-        assert!(!out.is_empty());
+        assert_ne!(out, strict_nt_of_an_empty_ontology());
     }
 
     #[test]
@@ -2503,7 +2857,21 @@ mod test {
             RDFWriterConfiguration { lax: false },
         )
         .unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out, strict_nt_of_an_empty_ontology());
+    }
+
+    /// What strict mode writes for an ontology with no IRI and no axioms: the
+    /// ontology's own node and nothing else.
+    fn strict_nt_of_an_empty_ontology() -> Vec<u8> {
+        let formatter = WriterQuadSerializerAdaptor::new(
+            RdfSerializer::from_format(oxrdfio::RdfFormat::NTriples).for_writer(Vec::new()),
+        );
+        write_to_rdf_formatter_with_config(
+            &ComponentMappedOntology::new_rc(),
+            formatter,
+            RDFWriterConfiguration { lax: false },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2522,7 +2890,7 @@ mod test {
             RdfSerializer::from_format(oxrdfio::RdfFormat::NTriples).for_writer(lax_sink),
         );
         let lax_out = write_to_rdf_formatter(&ont, lax_formatter).unwrap();
-        assert!(!lax_out.is_empty());
+        assert_ne!(lax_out, strict_nt_of_an_empty_ontology());
 
         let strict_sink = Vec::new();
         let strict_formatter = WriterQuadSerializerAdaptor::new(
@@ -2534,6 +2902,169 @@ mod test {
             RDFWriterConfiguration { lax: false },
         )
         .unwrap();
-        assert!(strict_out.is_empty());
+        assert_eq!(strict_out, strict_nt_of_an_empty_ontology());
+    }
+
+    /// An ontology with no IRI is a blank node carrying its imports and its
+    /// annotations, each stated of the ontology: written and read back, an
+    /// annotation with annotations of its own and the one after it both survive.
+    #[test]
+    fn an_anonymous_ontology_keeps_its_imports_and_annotations() {
+        let ofn = r#"Prefix(:=<http://example.org/t#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(
+Import(<http://example.org/other>)
+Annotation(Annotation(rdfs:comment "inner") rdfs:comment "a")
+Annotation(rdfs:label "b")
+Declaration(Class(:A))
+)"#;
+        let b = Build::new_rc();
+        let (ont, _): (SetOntology<RcStr>, _) = crate::io::ofn::reader::read(
+            &mut ofn.as_bytes(),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let amo: ComponentMappedOntology<RcStr, Rc<AnnotatedComponent<RcStr>>> = ont.clone().into();
+        let mut rdf = Vec::new();
+        write(&mut rdf, &amo, None).unwrap();
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ok(&mut rdf.as_slice()).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> = ont
+            .iter()
+            .filter(|c| !matches!(c.component, Component::OntologyID(_)) && !back.contains(*c))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "lost: {lost:#?}\n{}",
+            String::from_utf8_lossy(&rdf)
+        );
+    }
+
+    /// An empty list is `rdf:nil`: a class expression or data range with no
+    /// operands is written, and reads back as it was.
+    #[test]
+    fn an_empty_list_is_rdf_nil() {
+        let b = Build::new_rc();
+        let mut ont: ComponentMappedOntology<RcStr, Rc<AnnotatedComponent<RcStr>>> =
+            ComponentMappedOntology::new_rc();
+        ont.insert(OntologyID {
+            iri: Some(b.iri("http://example.org/t")),
+            viri: None,
+        });
+        ont.insert(DeclareClass(b.class("http://example.org/t#A")));
+        ont.insert(DeclareClass(b.class("http://example.org/t#B")));
+        ont.insert(DeclareDataProperty(
+            b.data_property("http://example.org/t#d"),
+        ));
+        ont.insert(SubClassOf {
+            sub: b.class("http://example.org/t#A").into(),
+            sup: ClassExpression::ObjectUnionOf(vec![]),
+        });
+        ont.insert(SubClassOf {
+            sub: b.class("http://example.org/t#B").into(),
+            sup: ClassExpression::ObjectIntersectionOf(vec![]),
+        });
+        ont.insert(DataPropertyRange {
+            dp: b.data_property("http://example.org/t#d"),
+            dr: DataRange::DataOneOf(vec![]),
+        });
+        let mut rdf = Vec::new();
+        write(&mut rdf, &ont, None).unwrap();
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ok(&mut rdf.as_slice()).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> = ont
+            .iter()
+            .filter(|c| !matches!(c.component, Component::OntologyID(_)) && !back.contains(*c))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "lost: {lost:#?}\n{}",
+            String::from_utf8_lossy(&rdf)
+        );
+    }
+
+    /// Each annotation is stated of what it annotates: after one with
+    /// annotations of its own, at any depth, the next is still of the axiom or
+    /// the annotation the two share. Written and read back, the axiom keeps
+    /// every annotation where it stood.
+    #[test]
+    fn an_annotation_after_a_nested_one_annotates_what_that_one_does() {
+        let ofn = r#"Prefix(:=<http://example.org/t#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(<http://example.org/t>
+Declaration(Class(:A))
+Declaration(Class(:C))
+SubClassOf(Annotation(Annotation(Annotation(rdfs:comment "m1") rdfs:comment "n1") Annotation(rdfs:label "n2") rdfs:comment "branch") Annotation(rdfs:label "plain") :A :C)
+)"#;
+        let b = Build::new_rc();
+        let (ont, _): (SetOntology<RcStr>, _) = crate::io::ofn::reader::read(
+            &mut ofn.as_bytes(),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let amo: ComponentMappedOntology<RcStr, Rc<AnnotatedComponent<RcStr>>> = ont.clone().into();
+        let mut rdf = Vec::new();
+        write(&mut rdf, &amo, None).unwrap();
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ok(&mut rdf.as_slice()).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> = ont
+            .iter()
+            .filter(|c| !matches!(c.component, Component::OntologyID(_)) && !back.contains(*c))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "lost: {lost:#?}\n{}",
+            String::from_utf8_lossy(&rdf)
+        );
+    }
+
+    /// An annotated axiom stated by a node of its own carries its annotations
+    /// on that node, and one whose object is a list states the list once:
+    /// written and read back, each keeps its annotations.
+    #[test]
+    fn annotated_axioms_with_a_node_or_a_list_read_back() {
+        let ofn = r#"Prefix(:=<http://example.org/t#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(<http://example.org/t>
+Declaration(Class(:A))
+Declaration(Class(:B))
+Declaration(Class(:C))
+Declaration(ObjectProperty(:p))
+Declaration(ObjectProperty(:q))
+Declaration(ObjectProperty(:r))
+Declaration(DataProperty(:d))
+Declaration(DataProperty(:e))
+Declaration(DataProperty(:f))
+Declaration(NamedIndividual(:i))
+Declaration(NamedIndividual(:j))
+Declaration(NamedIndividual(:k))
+DisjointObjectProperties(Annotation(rdfs:comment "op") :p ObjectInverseOf(:q) :r)
+DisjointDataProperties(Annotation(rdfs:comment "dp") :d :e :f)
+DisjointClasses(Annotation(rdfs:comment "dc") :A :B :C)
+DifferentIndividuals(Annotation(rdfs:comment "di") :i :j :k)
+NegativeObjectPropertyAssertion(Annotation(rdfs:comment "npa") :p :i :j)
+NegativeDataPropertyAssertion(Annotation(rdfs:comment "ndpa") :d :i "x")
+DisjointUnion(Annotation(rdfs:comment "du") :A :B :C)
+HasKey(Annotation(rdfs:comment "key") :A (:p) (:d))
+SubObjectPropertyOf(Annotation(rdfs:comment "chain") ObjectPropertyChain(:p :q) :r)
+)"#;
+        let b = Build::new_rc();
+        let (ont, _): (SetOntology<RcStr>, _) = crate::io::ofn::reader::read(
+            &mut ofn.as_bytes(),
+            crate::io::ParserConfiguration::new(&b),
+        )
+        .unwrap();
+        let amo: ComponentMappedOntology<RcStr, Rc<AnnotatedComponent<RcStr>>> = ont.clone().into();
+        let mut rdf = Vec::new();
+        write(&mut rdf, &amo, None).unwrap();
+        let back: std::collections::HashSet<AnnotatedComponent<RcStr>> =
+            read_ok(&mut rdf.as_slice()).into_iter().collect();
+        let lost: Vec<&AnnotatedComponent<RcStr>> =
+            ont.iter().filter(|c| !back.contains(*c)).collect();
+        assert!(
+            lost.is_empty(),
+            "lost: {lost:#?}\n{}",
+            String::from_utf8_lossy(&rdf)
+        );
     }
 }
