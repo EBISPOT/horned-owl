@@ -907,7 +907,7 @@ mod tests {
 
     use rstest::rstest;
 
-    use crate::model::{AnnotatedComponent, Ontology, RcStr};
+    use crate::model::{AnnotatedComponent, Component, Ontology, RcStr};
     use crate::ontology::component_mapped::ComponentMappedOntology;
     use crate::ontology::set::SetOntology;
 
@@ -921,7 +921,20 @@ mod tests {
     }
 
     fn axioms<O: Ontology<RcStr>>(ont: &O) -> BTreeSet<String> {
-        ont.iter().map(|ac| format!("{ac:?}")).collect()
+        ont.iter()
+            .map(|ac| {
+                // A rule's body and head are sets in OWL. The OFN writer
+                // behind the `owl-axioms:` fallback writes a two-atom one in
+                // OWLAPI's (swapped) order, so compare rules by their atoms
+                // sorted rather than in document order.
+                let mut ac: AnnotatedComponent<RcStr> = ac.clone();
+                if let Component::Rule(r) = &mut ac.component {
+                    r.body.sort();
+                    r.head.sort();
+                }
+                format!("{ac:?}")
+            })
+            .collect()
     }
 
     /// read(write(read(x))) == read(x) over every fixture in the oracle corpus.

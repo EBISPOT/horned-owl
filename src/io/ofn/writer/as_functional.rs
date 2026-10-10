@@ -10,47 +10,31 @@ use enum_meta::Meta;
 use crate::model::*;
 use crate::vocab::Facet;
 
-/// Whether `c` must be percent-encoded before it can appear inside an OFN
-/// `<...>` full IRI.
-///
-/// A conservative, position-independent subset of RFC 3987's illegal
-/// characters (gen-delims/unwise chars plus controls) -- under-flagging is
-/// safe here, since it only leaves already-broken input broken; the real
-/// risk is flagging too much and mangling a valid IRI. See #234.
-fn needs_iri_percent_encoding(c: char) -> bool {
-    matches!(
-        c,
-        '[' | ']' | '<' | '>' | '"' | ' ' | '\\' | '`' | '^' | '{' | '|' | '}'
-    ) || c.is_control()
+/// The datatype a bare quoted literal already denotes in OWL 2.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
+/// Whether `^^xsd:string` is written out explicitly. OWLAPI leaves it implicit
+/// (see the `Literal::Datatype` arm below), which is what ROBOT's output shows —
+/// but the OWLAPI bundled by some other tools does render it, and reproducing
+/// such a tool's file byte for byte needs the explicit form. Off by default.
+static WRITE_XSD_STRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set whether the functional writer renders `^^xsd:string` explicitly.
+pub fn set_write_xsd_string(on: bool) {
+    WRITE_XSD_STRING.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Percent-encodes every character [`needs_iri_percent_encoding`] flags in
-/// `s`, leaving the rest untouched.
-pub(super) fn percent_encode_iri(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s.chars().any(needs_iri_percent_encoding) {
-        return std::borrow::Cow::Borrowed(s);
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut buf = [0u8; 4];
-    for c in s.chars() {
-        if needs_iri_percent_encoding(c) {
-            for b in c.encode_utf8(&mut buf).as_bytes() {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    std::borrow::Cow::Owned(out)
+fn write_xsd_string() -> bool {
+    WRITE_XSD_STRING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Write a string literal while escaping `"` and `\` characters.
 fn quote(mut s: &str, f: &mut Formatter<'_>) -> Result<(), Error> {
     f.write_str("\"")?;
-    // `char_indices` yields byte offsets so the slices below land on char
-    // boundaries even when earlier characters are multi-byte. `'"'` and `'\\'`
-    // are both single-byte ASCII, so `i + 1` is always a valid boundary too.
+    // `char_indices` yields *byte* offsets, so slicing stays on char
+    // boundaries even when the string contains multi-byte UTF-8 characters.
+    // (Using `chars().enumerate()` here gives a char index and panics when a
+    // multi-byte char precedes a `"`/`\\`, e.g. Greek letters in a definition.)
     while let Some((i, c)) = s.char_indices().find(|(_, c)| *c == '\\' || *c == '"') {
         f.write_str(&s[..i])?;
         match c {
@@ -58,10 +42,60 @@ fn quote(mut s: &str, f: &mut Formatter<'_>) -> Result<(), Error> {
             '"' => f.write_str("\\\"")?,
             _ => unreachable!(),
         }
-        s = &s[i + 1..];
+        s = &s[i + c.len_utf8()..];
     }
     f.write_str(s)?;
     f.write_str("\"")
+}
+
+/// Which of OWL API's renderings of an object a rendering follows.
+#[derive(Clone, Copy)]
+pub enum Style<'t> {
+    /// A functional-syntax document's: the functional renderer writing an
+    /// object in the frame it stands in.
+    Document,
+    /// OWL API's `toString()`. A literal typed `xsd:string` says so; an IRI
+    /// an axiom names as an object (an annotation's subject or value, an
+    /// annotation property's domain or range) is written in full; a
+    /// cardinality restriction writes its filler, `owl:Thing` and
+    /// `rdfs:Literal` included; an intersection or union of one operand, and
+    /// an axiom of a set of fewer than two members, is written as it stands;
+    /// a facet restriction is
+    /// `facetRestriction(minInclusive "1"^^xsd:integer)`; a rule keeps its
+    /// atoms in their order, writes `Body(…) Head(…)` apart and names its
+    /// same- and different-individual atoms `SameAsAtom` and
+    /// `DifferentFromAtom`; and a same-individuals pair keeps its order.
+    Simple,
+    /// The functional renderer writing an object outside any frame, with every
+    /// entity, and every IRI an axiom names as an object (an annotation's
+    /// subject or value, an annotation property's domain or range, a rule's
+    /// variable or built-in), written as the function writes that IRI. A
+    /// literal typed `xsd:string` leaves the type implicit, and a
+    /// same-individuals pair, and a rule's body or head of two atoms, is
+    /// written second member first. Inside a declaration every such name
+    /// stands in its entity type, an IRI named as an object in `Class(…)`:
+    /// `Declaration(Annotation(AnnotationProperty(<p>) Class(<v>)) Class(<A>))`.
+    Named(&'t dyn Fn(&str) -> String),
+}
+
+impl std::fmt::Debug for Style<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        f.write_str(match self {
+            Style::Document => "Document",
+            Style::Simple => "Simple",
+            Style::Named(_) => "Named",
+        })
+    }
+}
+
+/// What a rendering abbreviates IRIs with, and the [`Style`] it follows.
+#[derive(Clone, Copy, Debug)]
+pub struct Context<'t> {
+    prefixes: Option<&'t PrefixMapping>,
+    style: Style<'t>,
+    /// Whether a [`Style::Named`] name stands in its entity type, as inside a
+    /// declaration.
+    typed: bool,
 }
 
 /// A trait for OWL elements that can be rendered in OWL Functional syntax.
@@ -74,7 +108,15 @@ pub trait AsFunctional<A: ForIRI> {
     /// with the `ToString` implementation.
     ///
     fn as_functional(&self) -> Functional<'_, Self, A> {
-        Functional(self, None, None)
+        Functional(
+            self,
+            Context {
+                prefixes: None,
+                style: Style::Document,
+                typed: false,
+            },
+            None,
+        )
     }
 
     /// Get a handle for displaying the element, using the given context.
@@ -86,7 +128,33 @@ pub trait AsFunctional<A: ForIRI> {
         &'t self,
         prefix: &'t PrefixMapping,
     ) -> Functional<'t, Self, A> {
-        Functional(self, Some(prefix), None)
+        Functional(
+            self,
+            Context {
+                prefixes: Some(prefix),
+                style: Style::Document,
+                typed: false,
+            },
+            None,
+        )
+    }
+
+    /// Get a handle for displaying the element as `style` renders it, with
+    /// IRIs abbreviated by `prefix`.
+    fn as_functional_styled<'t>(
+        &'t self,
+        prefix: &'t PrefixMapping,
+        style: Style<'t>,
+    ) -> Functional<'t, Self, A> {
+        Functional(
+            self,
+            Context {
+                prefixes: Some(prefix),
+                style,
+                typed: false,
+            },
+            None,
+        )
     }
 }
 
@@ -95,8 +163,8 @@ pub trait AsFunctional<A: ForIRI> {
 pub struct Functional<'t, T: ?Sized, A: ForIRI>(
     /// The element to display
     &'t T,
-    /// An eventual context to use (for IRI prefixes)
-    Option<&'t PrefixMapping>,
+    /// The prefixes IRIs are abbreviated with, and the rendering's style
+    Context<'t>,
     /// An eventual set of annotations (to render inside axioms)
     Option<&'t BTreeSet<Annotation<A>>>,
 );
@@ -220,14 +288,50 @@ derive_tuple3!(A, ObjectPropertyExpression<A>, Individual<A>, Individual<A>);
 
 impl<A: ForIRI> Display for Functional<'_, BTreeSet<Annotation<A>>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        for (i, x) in self.0.iter().enumerate() {
+        // OWLAPI renders an axiom's/entity's annotations in `compareTo` order, not
+        // the model's `BTreeSet` order. The only place the two diverge for OBO
+        // content is the annotation *value*: OWLAPI's type index orders IRI (0) <
+        // anonymous individual (1007) < literal (4008), whereas horned-owl's
+        // `AnnotationValue` enum orders literal first. Re-sort with the OWLAPI key
+        // so e.g. `Annotation(hasDbXref <orcid>)` precedes `Annotation(hasDbXref
+        // "PMID:…")`, matching ROBOT.
+        let mut anns: Vec<&Annotation<A>> = self.0.iter().collect();
+        anns.sort_by(owlapi_annotation_cmp);
+        for (i, x) in anns.iter().enumerate() {
             if i != 0 {
                 f.write_str(" ")?;
             }
-            write!(f, "{}", Functional(x, self.1, None))?;
+            write!(f, "{}", Functional(*x, self.1, None))?;
         }
         Ok(())
     }
+}
+
+/// OWLAPI's annotation-value type index: IRI < anonymous individual < literal.
+fn annotation_value_rank<A: ForIRI>(v: &AnnotationValue<A>) -> u8 {
+    match v {
+        AnnotationValue::IRI(_) => 0,
+        AnnotationValue::AnonymousIndividual(_) => 1,
+        AnnotationValue::Literal(_) => 2,
+    }
+}
+
+/// Compare two annotations the way OWLAPI's `OWLAnnotation.compareTo` does:
+/// property first, then value (by value-type index, then value content). Every
+/// leaf uses OWLAPI's own key — `IRI.compareTo` splits at the NCName suffix, and
+/// a literal compares on datatype before lexical form — so an annotation set
+/// orders the same way whether it hangs off an axiom or is an axiom itself.
+fn owlapi_annotation_cmp<A: ForIRI>(a: &&Annotation<A>, b: &&Annotation<A>) -> std::cmp::Ordering {
+    use super::{owlapi_iri_cmp, owlapi_literal_cmp};
+    owlapi_iri_cmp(a.ap.0.as_ref(), b.ap.0.as_ref())
+        .then_with(|| annotation_value_rank(&a.av).cmp(&annotation_value_rank(&b.av)))
+        .then_with(|| match (&a.av, &b.av) {
+            (AnnotationValue::IRI(x), AnnotationValue::IRI(y)) => {
+                owlapi_iri_cmp(x.as_ref(), y.as_ref())
+            }
+            (AnnotationValue::Literal(x), AnnotationValue::Literal(y)) => owlapi_literal_cmp(x, y),
+            _ => a.av.cmp(&b.av),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -237,10 +341,14 @@ macro_rules! derive_declaration {
         impl<'a, $A: ForIRI> Display for Functional<'a, $ty, $A> {
             fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
                 if let Some(annotations) = self.2 {
+                    let typed = Context {
+                        typed: matches!(self.1.style, Style::Named(_)),
+                        ..self.1
+                    };
                     write!(
                         f,
                         concat!("Declaration({} ", stringify!($name), "({}))"),
-                        Functional(annotations, self.1, None),
+                        Functional(annotations, typed, None),
                         Functional(&self.0.0, self.1, None)
                     )
                 } else {
@@ -293,13 +401,56 @@ macro_rules! derive_wrapper {
     };
 }
 
-derive_wrapper!(A, AnnotationProperty<A>);
-derive_wrapper!(A, Class<A>);
-derive_wrapper!(A, DataProperty<A>);
-derive_wrapper!(A, Datatype<A>);
-derive_wrapper!(A, NamedIndividual<A>);
 derive_wrapper!(A, OntologyAnnotation<A>);
-derive_wrapper!(A, ObjectProperty<A>);
+
+/// An entity's IRI, or a rule's variable or built-in, whose entity type is
+/// `kind`: as a [`Style::Named`] rendering names it, and otherwise as any IRI
+/// is written.
+fn entity_iri<A: ForIRI>(
+    iri: &IRI<A>,
+    kind: &str,
+    ctx: Context<'_>,
+    f: &mut Formatter<'_>,
+) -> Result<(), Error> {
+    match ctx.style {
+        Style::Named(names) if ctx.typed => write!(f, "{kind}({})", names(iri.as_ref())),
+        Style::Named(names) => f.write_str(&names(iri.as_ref())),
+        Style::Document | Style::Simple => Functional(iri, ctx, None).fmt(f),
+    }
+}
+
+/// An IRI an axiom names as an object: an annotation's subject or value, or
+/// an annotation property's domain or range. [`Style::Named`] names it as a
+/// class, and [`Style::Simple`] writes it in full.
+fn object_iri<A: ForIRI>(
+    iri: &IRI<A>,
+    ctx: Context<'_>,
+    f: &mut Formatter<'_>,
+) -> Result<(), Error> {
+    match ctx.style {
+        Style::Simple => write!(f, "<{}>", iri.as_ref() as &str),
+        Style::Document | Style::Named(_) => entity_iri(iri, "Class", ctx, f),
+    }
+}
+
+macro_rules! derive_entity {
+    ($A:ident, $ty:ty, $kind:ident) => {
+        impl<'a, $A: ForIRI> Display for Functional<'a, $ty, $A> {
+            fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+                entity_iri(&self.0.0, stringify!($kind), self.1, f)
+            }
+        }
+
+        impl<$A: ForIRI> AsFunctional<$A> for $ty {}
+    };
+}
+
+derive_entity!(A, AnnotationProperty<A>, AnnotationProperty);
+derive_entity!(A, Class<A>, Class);
+derive_entity!(A, DataProperty<A>, DataProperty);
+derive_entity!(A, Datatype<A>, Datatype);
+derive_entity!(A, NamedIndividual<A>, NamedIndividual);
+derive_entity!(A, ObjectProperty<A>, ObjectProperty);
 
 // ---------------------------------------------------------------------------
 
@@ -308,12 +459,13 @@ derive_wrapper!(A, ObjectProperty<A>);
 /// produce a shorter vec here (e.g. a degenerate `owl:AllDifferent` with one
 /// `owl:distinctMembers` entry), which is semantically vacuous -- writing it
 /// out anyway would produce `DifferentIndividuals(<one-iri>)`, syntax our
-/// own reader rejects. Drop the axiom instead of echoing unparseable output.
+/// own reader rejects. Drop the axiom instead of echoing unparseable output,
+/// except in [`Style::Simple`], which writes the axiom as it stands.
 macro_rules! derive_nary_axiom {
     ($A:ident, $ty:ty, $name:ident) => {
         impl<'a, $A: ForIRI> Display for Functional<'a, $ty, $A> {
             fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-                if self.0.0.len() < 2 {
+                if self.0.0.len() < 2 && !matches!(self.1.style, Style::Simple) {
                     return Ok(());
                 }
                 if let Some(annotations) = self.2 {
@@ -384,16 +536,26 @@ impl<'a, A: ForIRI> Display for Functional<'a, Annotation<A>, A> {
 }
 
 impl<A: ForIRI> AsFunctional<A> for Annotation<A> {}
-derive_axiom!(
-    A,
-    AnnotationPropertyRange<A>,
-    AnnotationPropertyRange(ap, iri)
-);
-derive_axiom!(
-    A,
-    AnnotationPropertyDomain<A>,
-    AnnotationPropertyDomain(ap, iri)
-);
+macro_rules! derive_annotation_property_iri_axiom {
+    ($A:ident, $ty:ty, $name:ident) => {
+        impl<'a, $A: ForIRI> Display for Functional<'a, $ty, $A> {
+            fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+                f.write_str(concat!(stringify!($name), "("))?;
+                if let Some(annotations) = self.2 {
+                    write!(f, "{} ", Functional(annotations, self.1, None))?;
+                }
+                write!(f, "{} ", Functional(&self.0.ap, self.1, None))?;
+                object_iri(&self.0.iri, self.1, f)?;
+                f.write_str(")")
+            }
+        }
+
+        impl<$A: ForIRI> AsFunctional<$A> for $ty {}
+    };
+}
+
+derive_annotation_property_iri_axiom!(A, AnnotationPropertyRange<A>, AnnotationPropertyRange);
+derive_annotation_property_iri_axiom!(A, AnnotationPropertyDomain<A>, AnnotationPropertyDomain);
 derive_axiom!(A, AsymmetricObjectProperty<A>, AsymmetricObjectProperty(0));
 derive_axiom!(A, ClassAssertion<A>, ClassAssertion(ce, i));
 derive_axiom!(
@@ -412,14 +574,11 @@ derive_nary_axiom!(A, EquivalentClasses<A>, EquivalentClasses);
 derive_nary_axiom!(A, EquivalentDataProperties<A>, EquivalentDataProperties);
 derive_nary_axiom!(A, EquivalentObjectProperties<A>, EquivalentObjectProperties);
 
+// A disjoint union is written whatever the number of its members: one member
+// makes `DisjointUnion(:U :B)` and none `DisjointUnion(:U )`, each of them an
+// axiom with a meaning of its own (`U ≡ B`, `U ≡ owl:Nothing`).
 impl<'a, A: ForIRI> Display for Functional<'a, DisjointUnion<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        // Same >= 2 grammar minimum as the other n-ary axioms above, but on
-        // the trailing `Vec<ClassExpression>` only -- the leading `Class` is
-        // a fixed single field, not part of the n-ary operand list.
-        if self.0.1.len() < 2 {
-            return Ok(());
-        }
         if let Some(annotations) = self.2 {
             write!(
                 f,
@@ -471,7 +630,47 @@ derive_axiom!(
 derive_axiom!(A, ObjectPropertyDomain<A>, ObjectPropertyDomain(ope, ce));
 derive_axiom!(A, ObjectPropertyRange<A>, ObjectPropertyRange(ope, ce));
 derive_axiom!(A, ReflexiveObjectProperty<A>, ReflexiveObjectProperty(0));
-derive_nary_axiom!(A, SameIndividual<A>, SameIndividual);
+/// The positions of a collection's `len` members in the order they are
+/// written: as they stand, except that a pair is written second member first
+/// unless its first member is the entity whose frame is being written
+/// (`first_is_focus`).
+fn written_order(len: usize, first_is_focus: bool) -> Vec<usize> {
+    if len == 2 && !first_is_focus {
+        vec![1, 0]
+    } else {
+        (0..len).collect()
+    }
+}
+
+// The frame a same-individuals axiom stands in is its first named member's, so
+// a pair whose first member is anonymous is written turned round.
+impl<'a, A: ForIRI> Display for Functional<'a, SameIndividual<A>, A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        let members = &self.0.0;
+        if members.len() < 2 && !matches!(self.1.style, Style::Simple) {
+            return Ok(());
+        }
+        let order = match self.1.style {
+            Style::Document => {
+                written_order(members.len(), matches!(members[0], Individual::Named(_)))
+            }
+            Style::Simple => (0..members.len()).collect(),
+            Style::Named(_) => written_order(members.len(), false),
+        };
+        let members: Vec<Individual<A>> = order.iter().map(|&i| members[i].clone()).collect();
+        match self.2 {
+            Some(annotations) => write!(
+                f,
+                "SameIndividual({} {})",
+                Functional(annotations, self.1, None),
+                Functional(&members, self.1, None)
+            ),
+            None => write!(f, "SameIndividual({})", Functional(&members, self.1, None)),
+        }
+    }
+}
+
+impl<A: ForIRI> AsFunctional<A> for SameIndividual<A> {}
 derive_axiom!(A, SubClassOf<A>, SubClassOf(sub, sup));
 derive_axiom!(
     A,
@@ -530,7 +729,7 @@ impl<A: ForIRI> Display for Functional<'_, AnnotationSubject<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         use AnnotationSubject::*;
         match &self.0 {
-            IRI(iri) => Functional(iri, self.1, None).fmt(f),
+            IRI(iri) => object_iri(iri, self.1, f),
             AnonymousIndividual(anon) => Functional(anon, self.1, None).fmt(f),
         }
     }
@@ -545,7 +744,7 @@ impl<A: ForIRI> Display for Functional<'_, AnnotationValue<A>, A> {
         use AnnotationValue::*;
         match &self.0 {
             Literal(lit) => Functional(lit, self.1, None).fmt(f),
-            IRI(iri) => Functional(iri, self.1, None).fmt(f),
+            IRI(iri) => object_iri(iri, self.1, f),
             AnonymousIndividual(ai) => Functional(ai, self.1, None).fmt(f),
         }
     }
@@ -579,12 +778,9 @@ impl<A: ForIRI> Display for Functional<'_, Atom<A>, A> {
         use Atom::*;
         match self.0 {
             BuiltInAtom { pred, args } => {
-                write!(
-                    f,
-                    "BuiltInAtom({} {})",
-                    Functional(&pred, self.1, None),
-                    Functional(&args, self.1, None),
-                )
+                f.write_str("BuiltInAtom(")?;
+                entity_iri(pred, "Class", self.1, f)?;
+                write!(f, " {})", Functional(&args, self.1, None))
             }
             ClassAtom { pred, arg } => {
                 write!(
@@ -612,9 +808,13 @@ impl<A: ForIRI> Display for Functional<'_, Atom<A>, A> {
                 )
             }
             DifferentIndividualsAtom(i1, i2) => {
+                let name = match self.1.style {
+                    Style::Simple => "DifferentFromAtom",
+                    Style::Document | Style::Named(_) => "DifferentIndividualsAtom",
+                };
                 write!(
                     f,
-                    "DifferentIndividualsAtom({} {})",
+                    "{name}({} {})",
                     Functional(&i1, self.1, None),
                     Functional(&i2, self.1, None),
                 )
@@ -628,9 +828,13 @@ impl<A: ForIRI> Display for Functional<'_, Atom<A>, A> {
                 )
             }
             SameIndividualAtom(i1, i2) => {
+                let name = match self.1.style {
+                    Style::Simple => "SameAsAtom",
+                    Style::Document | Style::Named(_) => "SameIndividualAtom",
+                };
                 write!(
                     f,
-                    "SameIndividualAtom({} {})",
+                    "{name}({} {})",
                     Functional(&i1, self.1, None),
                     Functional(&i2, self.1, None),
                 )
@@ -713,11 +917,13 @@ impl<A: ForIRI> AsFunctional<A> for Component<A> {}
 impl<A: ForIRI> Display for Functional<'_, ClassExpression<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         use ClassExpression::*;
+        let simple = matches!(self.1.style, Style::Simple);
         macro_rules! object_cardinality {
             ($name:literal, $n:ident, $ope:ident, $bce:ident, $self:ident, $f:ident) => {
                 match $bce.as_ref() {
                     ClassExpression::Class(cls)
-                        if cls.0.as_ref() == crate::vocab::OWL::Thing.as_ref() =>
+                        if cls.0.as_ref() == crate::vocab::OWL::Thing.as_ref()
+                            && !matches!($self.1.style, Style::Simple) =>
                     {
                         write!(
                             f,
@@ -742,7 +948,8 @@ impl<A: ForIRI> Display for Functional<'_, ClassExpression<A>, A> {
             ($name:literal, $n:ident, $dp:ident, $dr:ident, $self:ident, $f:ident) => {
                 match $dr {
                     DataRange::Datatype(dt)
-                        if dt.0.as_ref() == crate::vocab::OWL2Datatype::Literal.as_ref() =>
+                        if dt.0.as_ref() == crate::vocab::OWL2Datatype::Literal.as_ref()
+                            && !matches!($self.1.style, Style::Simple) =>
                     {
                         write!(
                             f,
@@ -767,8 +974,9 @@ impl<A: ForIRI> Display for Functional<'_, ClassExpression<A>, A> {
             Class(exp) => Functional(exp, self.1, None).fmt(f),
             // A single-operand intersection/union is just that operand --
             // the OFN grammar requires >= 2, so wrapping it verbatim would
-            // write output its own reader rejects (#235).
-            ObjectIntersectionOf(classes) if classes.len() == 1 => {
+            // write output its own reader rejects (#235). [`Style::Simple`]
+            // writes it as it stands.
+            ObjectIntersectionOf(classes) if classes.len() == 1 && !simple => {
                 Functional(&classes[0], self.1, None).fmt(f)
             }
             ObjectIntersectionOf(classes) => {
@@ -778,7 +986,7 @@ impl<A: ForIRI> Display for Functional<'_, ClassExpression<A>, A> {
                     Functional(classes, self.1, None)
                 )
             }
-            ObjectUnionOf(classes) if classes.len() == 1 => {
+            ObjectUnionOf(classes) if classes.len() == 1 && !simple => {
                 Functional(&classes[0], self.1, None).fmt(f)
             }
             ObjectUnionOf(classes) => {
@@ -874,8 +1082,17 @@ impl<A: ForIRI> AsFunctional<A> for ClassExpression<A> {}
 impl<A: ForIRI> Display for Functional<'_, DataRange<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         use DataRange::*;
+        let simple = matches!(self.1.style, Style::Simple);
         match self.0 {
             Datatype(dt) => Functional(dt, self.1, None).fmt(f),
+            // As for classes, a single-operand intersection or union is just
+            // that operand, but as it stands in [`Style::Simple`].
+            DataIntersectionOf(dts) if dts.len() == 1 && !simple => {
+                Functional(&dts[0], self.1, None).fmt(f)
+            }
+            DataUnionOf(dts) if dts.len() == 1 && !simple => {
+                Functional(&dts[0], self.1, None).fmt(f)
+            }
             DataIntersectionOf(dts) => {
                 write!(f, "DataIntersectionOf({})", Functional(dts, self.1, None))
             }
@@ -935,12 +1152,23 @@ impl<A: ForIRI> AsFunctional<A> for Facet {}
 
 impl<A: ForIRI> Display for Functional<'_, FacetRestriction<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(
-            f,
-            "{} {}",
-            Functional::<Facet, String>(&self.0.f, self.1, None),
-            Functional(&self.0.l, self.1, None)
-        )
+        match self.1.style {
+            Style::Simple => {
+                let iri: &str = self.0.f.meta().as_ref();
+                let name = iri.rsplit_once('#').map_or(iri, |(_, name)| name);
+                write!(
+                    f,
+                    "facetRestriction({name} {})",
+                    Functional(&self.0.l, self.1, None)
+                )
+            }
+            Style::Document | Style::Named(_) => write!(
+                f,
+                "{} {}",
+                Functional::<Facet, String>(&self.0.f, self.1, None),
+                Functional(&self.0.l, self.1, None)
+            ),
+        }
     }
 }
 
@@ -950,7 +1178,11 @@ impl<A: ForIRI> AsFunctional<A> for FacetRestriction<A> {}
 
 impl<A: ForIRI> Display for Functional<'_, HasKey<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(f, "HasKey({} ", Functional(&self.0.ce, self.1, None))?;
+        f.write_str("HasKey(")?;
+        if let Some(annotations) = self.2 {
+            write!(f, "{} ", Functional(annotations, self.1, None))?;
+        }
+        write!(f, "{} ", Functional(&self.0.ce, self.1, None))?;
 
         f.write_str("(")?;
         let mut n = 0;
@@ -998,50 +1230,19 @@ impl<A: ForIRI> AsFunctional<A> for IArgument<A> {}
 
 // ---------------------------------------------------------------------------
 
-/// Whether `s` is usable, as-is, as an OFN `AbbreviatedIRI` local part.
-///
-/// A conservative approximation of the grammar -- under-approximating is
-/// safe, since callers fall back to the full `<IRI>` form on `false`.
-fn is_valid_ofn_local_part(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_alphanumeric() || c == '_' => {}
-        _ => return false,
-    }
-    s.chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-}
-
-/// Abbreviate `iri` against `prefixes` as `prefix:local`, if possible.
-///
-/// Doesn't use `curie::PrefixMapping::shrink_iri`: its `Display` for a
-/// default-prefix match omits the colon OFN's grammar requires (#230), and
-/// it picks whichever prefix was inserted first rather than the longest
-/// (most specific) matching one (#148).
-///
-/// Falls back to the full `<IRI>` form when no mapping gives a valid
-/// local part.
-fn shrink_iri_for_ofn<'a>(prefixes: &'a PrefixMapping, iri: &str) -> Option<(&'a str, String)> {
-    prefixes
-        .mappings()
-        .filter_map(|(name, value)| {
-            let local = iri.strip_prefix(value.as_str())?;
-            is_valid_ofn_local_part(local).then(|| (name.as_str(), value.len(), local.to_string()))
-        })
-        .max_by_key(|(_, len, _)| *len)
-        .map(|(name, _, local)| (name, local))
-}
-
 impl<A: ForIRI> Display for Functional<'_, IRI<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        if let Some(prefixes) = self.1.as_ref() {
-            match shrink_iri_for_ofn(prefixes, self.0) {
-                Some((name, local)) => write!(f, "{name}:{local}"),
-                None => write!(f, "<{}>", percent_encode_iri(self.0)),
+        if let Some(prefixes) = self.1.prefixes {
+            // Longest-valid-match abbreviation (OWLAPI semantics), not
+            // `curie::shrink_iri`'s first-declared match — so `obo:` and a more
+            // specific `uberon:` can both be declared and each IRI abbreviates to
+            // its most specific valid CURIE, falling back to the full IRI when
+            // none is valid.
+            if let Some((prefix, local)) = super::shrink_valid(prefixes, self.0.as_ref()) {
+                return write!(f, "{prefix}:{local}");
             }
-        } else {
-            write!(f, "<{}>", percent_encode_iri(self.0))
         }
+        write!(f, "<{}>", self.0)
     }
 }
 
@@ -1093,7 +1294,22 @@ impl<A: ForIRI> Display for Functional<'_, Literal<A>, A> {
                 datatype_iri,
             } => {
                 quote(literal, f)?;
-                write!(f, "^^{}", Functional(datatype_iri, self.1, None))
+                // `xsd:string` is the datatype a bare quoted literal already
+                // denotes in OWL 2, and OWLAPI's functional renderer leaves it
+                // implicit — ROBOT's own functional output of an OBO-parsed
+                // ontology, whose literals are all `OWLLiteralImplString`, carries
+                // no `^^xsd:string` at all. Writing it out would also preserve a
+                // distinction across the file that OWLAPI loses there, which is
+                // not the same document.
+                let typed = match self.1.style {
+                    Style::Document => write_xsd_string(),
+                    Style::Simple => true,
+                    Style::Named(_) => false,
+                };
+                if datatype_iri.as_ref() != XSD_STRING || typed {
+                    write!(f, "^^{}", Functional(datatype_iri, self.1, None))?;
+                }
+                Ok(())
             }
         }
     }
@@ -1121,22 +1337,51 @@ impl<A: ForIRI> AsFunctional<A> for ObjectPropertyExpression<A> {}
 
 impl<A: ForIRI> Display for Functional<'_, Rule<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        // OWLAPI separates the rule's annotations and each atom with a space, and
+        // writes `Body(…)Head(…)` adjacent:
+        //
+        //     DLSafeRule(Annotation(…) Body(ClassAtom(…) ObjectPropertyAtom(…))Head(…))
+        //
+        // Everything here ran together, which put every SWRL rule in OBA's
+        // `imports/merged_import.owl` a byte off ROBOT's.
         if let Some(annotations) = self.2 {
-            write!(f, "DLSafeRule({}", Functional(annotations, self.1, None))?;
+            write!(f, "DLSafeRule({} ", Functional(annotations, self.1, None))?;
         } else {
             write!(f, "DLSafeRule(")?;
         }
 
+        // An atom is never the entity of a frame, so a two-atom body or head is
+        // written in the opposite order to the one stored ([`written_order`]).
+        // UBERON's three rules are the visible case: the RDF list in
+        // `mirror/uberon.owl` runs `BFO_0000050(x,y)`, `BSPO_0000120(y,z)`, and the
+        // body is written `Body(BSPO_0000120(y,z) BFO_0000050(x,y))`. Reading that
+        // back and writing it again swaps it once more: the order is the writer's,
+        // not the model's.
+        let simple = matches!(self.1.style, Style::Simple);
+        let write_atoms = |f: &mut Formatter<'_>, atoms: &[crate::model::Atom<A>]| {
+            let order: Vec<usize> = if simple {
+                (0..atoms.len()).collect()
+            } else {
+                written_order(atoms.len(), false)
+            };
+            for (i, &ix) in order.iter().enumerate() {
+                if i > 0 {
+                    f.write_char(' ')?;
+                }
+                Functional(&atoms[ix], self.1, None).fmt(f)?;
+            }
+            Ok::<(), Error>(())
+        };
+
         f.write_str("Body(")?;
-        for atom in self.0.body.iter() {
-            Functional(&atom, self.1, None).fmt(f)?;
-        }
+        write_atoms(f, &self.0.body)?;
         f.write_char(')')?;
+        if simple {
+            f.write_char(' ')?;
+        }
 
         f.write_str("Head(")?;
-        for atom in self.0.head.iter() {
-            Functional(&atom, self.1, None).fmt(f)?;
-        }
+        write_atoms(f, &self.0.head)?;
         f.write_char(')')?;
         f.write_char(')')
     }
@@ -1168,7 +1413,9 @@ impl<A: ForIRI> AsFunctional<A> for SubObjectPropertyExpression<A> {}
 
 impl<A: ForIRI> Display for Functional<'_, Variable<A>, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(f, "Variable({})", Functional(&self.0.0, self.1, None))
+        f.write_str("Variable(")?;
+        entity_iri(&self.0.0, "Class", self.1, f)?;
+        f.write_str(")")
     }
 }
 
@@ -1179,7 +1426,7 @@ impl<A: ForIRI> AsFunctional<A> for Variable<A> {}
 impl<A: ForIRI> Display for Functional<'_, curie::PrefixMapping, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         for (name, value) in self.0.mappings() {
-            writeln!(f, "Prefix({name}:=<{}>)", percent_encode_iri(value))?;
+            writeln!(f, "Prefix({name}:=<{value}>)")?;
         }
         Ok(())
     }
@@ -1219,6 +1466,272 @@ mod tests {
 
     use super::*;
     use std::iter::FromIterator;
+
+    /// The two renderings of one object OWL API gives beside a document's:
+    /// `toString()`, and the functional renderer outside any frame naming
+    /// every entity and object IRI by a function.
+    #[test]
+    fn each_style_renders_an_object_as_its_renderer_does() {
+        let build = Build::new_rc();
+        let ex = |name: &str| format!("http://example.org/s#{name}");
+        let mut prefixes = PrefixMapping::default();
+        prefixes
+            .add_prefix("xsd", "http://www.w3.org/2001/XMLSchema#")
+            .unwrap();
+        prefixes
+            .add_prefix("owl", "http://www.w3.org/2002/07/owl#")
+            .unwrap();
+        prefixes
+            .add_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#")
+            .unwrap();
+        let names = |iri: &str| format!("<{}>[{}]", iri, iri.rsplit('#').next().unwrap());
+        let render = |c: &Component<RcStr>, style: Style<'_>| {
+            AnnotatedComponent {
+                component: c.clone(),
+                ann: BTreeSet::new(),
+            }
+            .as_functional_styled(&prefixes, style)
+            .to_string()
+        };
+        let var = |n: &str| IArgument::Variable(Variable(build.iri(ex(n))));
+
+        let rule: Component<RcStr> = Rule {
+            body: vec![
+                Atom::ClassAtom {
+                    pred: ClassExpression::Class(build.class(ex("A"))),
+                    arg: var("v"),
+                },
+                Atom::BuiltInAtom {
+                    pred: build.iri(ex("gt")),
+                    args: vec![DArgument::Literal(Literal::Datatype {
+                        literal: "5".into(),
+                        datatype_iri: build.iri("http://www.w3.org/2001/XMLSchema#integer"),
+                    })],
+                },
+            ],
+            head: vec![
+                Atom::ClassAtom {
+                    pred: ClassExpression::Class(build.class(ex("B"))),
+                    arg: var("v"),
+                },
+                Atom::SameIndividualAtom(var("v"), var("w")),
+            ],
+        }
+        .into();
+        assert_eq!(
+            render(&rule, Style::Simple),
+            "DLSafeRule(Body(ClassAtom(<http://example.org/s#A> Variable(<http://example.org/s#v>)) \
+             BuiltInAtom(<http://example.org/s#gt> \"5\"^^xsd:integer)) \
+             Head(ClassAtom(<http://example.org/s#B> Variable(<http://example.org/s#v>)) \
+             SameAsAtom(Variable(<http://example.org/s#v>) Variable(<http://example.org/s#w>))))"
+        );
+        assert_eq!(
+            render(&rule, Style::Named(&names)),
+            "DLSafeRule(Body(BuiltInAtom(<http://example.org/s#gt>[gt] \"5\"^^xsd:integer) \
+             ClassAtom(<http://example.org/s#A>[A] Variable(<http://example.org/s#v>[v])))\
+             Head(SameIndividualAtom(Variable(<http://example.org/s#v>[v]) Variable(<http://example.org/s#w>[w])) \
+             ClassAtom(<http://example.org/s#B>[B] Variable(<http://example.org/s#v>[v]))))"
+        );
+
+        let typed = Literal::Datatype {
+            literal: "x".into(),
+            datatype_iri: build.iri("http://www.w3.org/2001/XMLSchema#string"),
+        };
+        let restriction: Component<RcStr> = SubClassOf {
+            sub: ClassExpression::Class(build.class(ex("A"))),
+            sup: ClassExpression::DataSomeValuesFrom {
+                dp: build.data_property(ex("d")),
+                dr: DataRange::DatatypeRestriction(
+                    build.datatype("http://www.w3.org/2001/XMLSchema#integer"),
+                    vec![FacetRestriction {
+                        f: Facet::MinInclusive,
+                        l: Literal::Datatype {
+                            literal: "1".into(),
+                            datatype_iri: build.iri("http://www.w3.org/2001/XMLSchema#integer"),
+                        },
+                    }],
+                ),
+            },
+        }
+        .into();
+        assert_eq!(
+            render(&restriction, Style::Simple),
+            "SubClassOf(<http://example.org/s#A> DataSomeValuesFrom(<http://example.org/s#d> \
+             DatatypeRestriction(xsd:integer facetRestriction(minInclusive \"1\"^^xsd:integer))))"
+        );
+        assert_eq!(
+            render(&restriction, Style::Named(&names)),
+            "SubClassOf(<http://example.org/s#A>[A] DataSomeValuesFrom(<http://example.org/s#d>[d] \
+             DatatypeRestriction(<http://www.w3.org/2001/XMLSchema#integer>[integer] \
+             xsd:minInclusive \"1\"^^xsd:integer)))"
+        );
+
+        let assertion: Component<RcStr> = AnnotationAssertion {
+            subject: AnnotationSubject::IRI(build.iri(ex("A"))),
+            ann: Annotation {
+                ap: build.annotation_property(ex("ap")),
+                av: AnnotationValue::Literal(typed),
+                ann: BTreeSet::new(),
+            },
+        }
+        .into();
+        assert_eq!(
+            render(&assertion, Style::Simple),
+            "AnnotationAssertion(<http://example.org/s#ap> <http://example.org/s#A> \"x\"^^xsd:string)"
+        );
+        assert_eq!(
+            render(&assertion, Style::Named(&names)),
+            "AnnotationAssertion(<http://example.org/s#ap>[ap] <http://example.org/s#A>[A] \"x\")"
+        );
+
+        let range: Component<RcStr> = AnnotationPropertyRange {
+            ap: build.annotation_property(ex("ap")),
+            iri: build.iri(ex("B")),
+        }
+        .into();
+        assert_eq!(
+            render(&range, Style::Simple),
+            "AnnotationPropertyRange(<http://example.org/s#ap> <http://example.org/s#B>)"
+        );
+        assert_eq!(
+            render(&range, Style::Named(&names)),
+            "AnnotationPropertyRange(<http://example.org/s#ap>[ap] <http://example.org/s#B>[B])"
+        );
+
+        let same: Component<RcStr> = SameIndividual(vec![
+            Individual::Named(build.named_individual(ex("i"))),
+            Individual::Named(build.named_individual(ex("j"))),
+        ])
+        .into();
+        assert_eq!(
+            render(&same, Style::Simple),
+            "SameIndividual(<http://example.org/s#i> <http://example.org/s#j>)"
+        );
+        assert_eq!(
+            render(&same, Style::Document),
+            "SameIndividual(<http://example.org/s#i> <http://example.org/s#j>)"
+        );
+        assert_eq!(
+            render(&same, Style::Named(&names)),
+            "SameIndividual(<http://example.org/s#j>[j] <http://example.org/s#i>[i])"
+        );
+
+        let string_range: Component<RcStr> = AnnotationPropertyRange {
+            ap: build.annotation_property(ex("ap")),
+            iri: build.iri("http://www.w3.org/2001/XMLSchema#string"),
+        }
+        .into();
+        assert_eq!(
+            render(&string_range, Style::Simple),
+            "AnnotationPropertyRange(<http://example.org/s#ap> <http://www.w3.org/2001/XMLSchema#string>)"
+        );
+        assert_eq!(
+            render(&string_range, Style::Document),
+            "AnnotationPropertyRange(<http://example.org/s#ap> xsd:string)"
+        );
+
+        let cardinalities: Component<RcStr> = SubClassOf {
+            sub: ClassExpression::ObjectMinCardinality {
+                n: 1,
+                ope: ObjectPropertyExpression::ObjectProperty(build.object_property(ex("p"))),
+                bce: Box::new(ClassExpression::Class(
+                    build.class("http://www.w3.org/2002/07/owl#Thing"),
+                )),
+            },
+            sup: ClassExpression::DataMaxCardinality {
+                n: 2,
+                dp: build.data_property(ex("d")),
+                dr: DataRange::Datatype(
+                    build.datatype("http://www.w3.org/2000/01/rdf-schema#Literal"),
+                ),
+            },
+        }
+        .into();
+        assert_eq!(
+            render(&cardinalities, Style::Simple),
+            "SubClassOf(ObjectMinCardinality(1 <http://example.org/s#p> owl:Thing) \
+             DataMaxCardinality(2 <http://example.org/s#d> rdfs:Literal))"
+        );
+        assert_eq!(
+            render(&cardinalities, Style::Document),
+            "SubClassOf(ObjectMinCardinality(1 <http://example.org/s#p>) DataMaxCardinality(2 <http://example.org/s#d>))"
+        );
+        assert_eq!(
+            render(&cardinalities, Style::Named(&names)),
+            "SubClassOf(ObjectMinCardinality(1 <http://example.org/s#p>[p]) DataMaxCardinality(2 <http://example.org/s#d>[d]))"
+        );
+
+        let one_operand: Component<RcStr> = EquivalentClasses(vec![
+            ClassExpression::Class(build.class(ex("A"))),
+            ClassExpression::ObjectUnionOf(vec![ClassExpression::Class(build.class(ex("B")))]),
+        ])
+        .into();
+        assert_eq!(
+            render(&one_operand, Style::Simple),
+            "EquivalentClasses(<http://example.org/s#A> ObjectUnionOf(<http://example.org/s#B>))"
+        );
+        assert_eq!(
+            render(&one_operand, Style::Named(&names)),
+            "EquivalentClasses(<http://example.org/s#A>[A] <http://example.org/s#B>[B])"
+        );
+        let one_range: Component<RcStr> = DataPropertyRange {
+            dp: build.data_property(ex("d")),
+            dr: DataRange::DataUnionOf(vec![DataRange::Datatype(
+                build.datatype("http://www.w3.org/2001/XMLSchema#integer"),
+            )]),
+        }
+        .into();
+        assert_eq!(
+            render(&one_range, Style::Simple),
+            "DataPropertyRange(<http://example.org/s#d> DataUnionOf(xsd:integer))"
+        );
+        assert_eq!(
+            render(&one_range, Style::Document),
+            "DataPropertyRange(<http://example.org/s#d> xsd:integer)"
+        );
+
+        let one_member: Component<RcStr> =
+            DifferentIndividuals(vec![Individual::Named(build.named_individual(ex("j")))]).into();
+        assert_eq!(
+            render(&one_member, Style::Simple),
+            "DifferentIndividuals(<http://example.org/s#j>)"
+        );
+        assert_eq!(render(&one_member, Style::Named(&names)), "");
+        let one_same: Component<RcStr> =
+            SameIndividual(vec![Individual::Named(build.named_individual(ex("j")))]).into();
+        assert_eq!(
+            render(&one_same, Style::Simple),
+            "SameIndividual(<http://example.org/s#j>)"
+        );
+        assert_eq!(render(&one_same, Style::Document), "");
+
+        let declaration = AnnotatedComponent {
+            component: Component::DeclareClass(DeclareClass(build.class(ex("A")))),
+            ann: BTreeSet::from([Annotation {
+                ap: build.annotation_property(ex("ap")),
+                av: AnnotationValue::IRI(build.iri(ex("v"))),
+                ann: BTreeSet::new(),
+            }]),
+        };
+        let render_declaration = |style: Style<'_>| {
+            declaration
+                .as_functional_styled(&prefixes, style)
+                .to_string()
+        };
+        assert_eq!(
+            render_declaration(Style::Named(&names)),
+            "Declaration(Annotation(AnnotationProperty(<http://example.org/s#ap>[ap]) Class(<http://example.org/s#v>[v])) \
+             Class(<http://example.org/s#A>[A]))"
+        );
+        assert_eq!(
+            render_declaration(Style::Simple),
+            "Declaration(Annotation(<http://example.org/s#ap> <http://example.org/s#v>) Class(<http://example.org/s#A>))"
+        );
+        assert_eq!(
+            render_declaration(Style::Document),
+            "Declaration(Annotation(<http://example.org/s#ap> <http://example.org/s#v>) Class(<http://example.org/s#A>))"
+        );
+    }
 
     #[test]
     fn test_ofn_declareclass() {
@@ -1318,6 +1831,35 @@ mod tests {
         );
     }
 
+    /// A pair of same individuals whose first member is anonymous stands in no
+    /// named member's frame, and is written turned round; a pair led by a named
+    /// member, and three or more members, are written as they stand.
+    #[test]
+    fn test_ofn_same_individual_pair_led_by_anonymous_is_turned() {
+        let build = Build::new_arc();
+        let named =
+            |s: &str| Individual::from(build.named_individual(format!("http://example.com/{s}")));
+        let anon = |s: &str| Individual::from(build.anon(s));
+        let written =
+            |members: Vec<Individual<_>>| format!("{}", SameIndividual(members).as_functional());
+        assert_eq!(
+            written(vec![anon("_:a"), anon("_:b")]),
+            "SameIndividual(_:b _:a)"
+        );
+        assert_eq!(
+            written(vec![anon("_:a"), named("n")]),
+            "SameIndividual(<http://example.com/n> _:a)"
+        );
+        assert_eq!(
+            written(vec![named("n"), anon("_:a")]),
+            "SameIndividual(<http://example.com/n> _:a)"
+        );
+        assert_eq!(
+            written(vec![anon("_:a"), anon("_:b"), anon("_:c")]),
+            "SameIndividual(_:a _:b _:c)"
+        );
+    }
+
     #[test]
     fn test_ofn_literal_language() {
         let lit = Literal::<String>::Language {
@@ -1328,18 +1870,31 @@ mod tests {
         assert_eq!(r#""hello"@en"#, &ofn);
     }
 
+    /// `xsd:string` is the datatype a bare quoted literal already has, so the
+    /// writer leaves it implicit unless `set_write_xsd_string` turns it on. The
+    /// flag is process-global, so this asserts the default rather than toggling it
+    /// underneath whatever else the test binary is running in parallel.
     #[test]
-    fn test_ofn_literal_datatype() {
+    fn test_ofn_literal_datatype_xsd_string_is_implicit() {
         let build = Build::new_arc();
         let lit = Literal::Datatype {
             literal: String::from("hello"),
             datatype_iri: build.iri("http://www.w3.org/2001/XMLSchema#string"),
         };
         let ofn = format!("{}", lit.as_functional());
-        assert_eq!(
-            r#""hello"^^<http://www.w3.org/2001/XMLSchema#string>"#,
-            &ofn
-        );
+        assert_eq!(r#""hello""#, &ofn);
+    }
+
+    /// Every other datatype is still written out.
+    #[test]
+    fn test_ofn_literal_datatype() {
+        let build = Build::new_arc();
+        let lit = Literal::Datatype {
+            literal: String::from("42"),
+            datatype_iri: build.iri("http://www.w3.org/2001/XMLSchema#integer"),
+        };
+        let ofn = format!("{}", lit.as_functional());
+        assert_eq!(r#""42"^^<http://www.w3.org/2001/XMLSchema#integer>"#, &ofn);
     }
 
     #[test]
@@ -1417,29 +1972,29 @@ mod tests {
         assert_eq!("Declaration(Class(egc:DEF))", ofn);
     }
 
-    // Regression test for #234: a literal '[' or ']' (legal in an XML
-    // attribute, so real-world OWL/XML ontologies contain it, but not legal
-    // unescaped in OFN's <...> FullIRI) must be percent-encoded, in both the
-    // full-IRI form and a Prefix(name:=<...>) declaration line.
+    // An IRI is written as it stands, whatever characters it holds, in the
+    // full-IRI form and in a prefix declaration alike, and reads back the same.
     #[test]
-    fn test_ofn_iri_with_illegal_characters_is_percent_encoded() {
+    fn test_ofn_iri_is_written_as_it_stands() {
         let build = Build::new_arc();
 
-        let decl = DeclareClass(build.class("http://example.org/KB-CH[R]-8-5"));
+        let decl = DeclareClass(build.class("http://example.org/KB-CH[R]-8-5 {x}"));
         let ofn = format!("{}", decl.as_functional());
         assert_eq!(
-            "Declaration(Class(<http://example.org/KB-CH%5BR%5D-8-5>))",
+            "Declaration(Class(<http://example.org/KB-CH[R]-8-5 {x}>))",
             ofn
         );
 
-        let reparsed: Result<(crate::ontology::set::SetOntology<RcStr>, _), _> =
+        let (reparsed, _): (crate::ontology::set::SetOntology<RcStr>, _) =
             crate::io::ofn::reader::read(
                 &mut std::io::Cursor::new(format!(
                     "Prefix(:=<http://ex/>)\nOntology(<http://ex/o>\n{ofn}\n)"
                 )),
                 Default::default(),
-            );
-        assert!(reparsed.is_ok(), "reparse failed: {reparsed:?}");
+            )
+            .unwrap();
+        assert!(reparsed.iter().any(|ac| matches!(&ac.component,
+            Component::DeclareClass(DeclareClass(c)) if &*c.0 == "http://example.org/KB-CH[R]-8-5 {x}")));
 
         let mut prefixes = curie::PrefixMapping::default();
         prefixes
@@ -1447,12 +2002,17 @@ mod tests {
             .ok();
         let rendered = format!(
             "{}",
-            Functional::<curie::PrefixMapping, RcStr>(&prefixes, None, None)
+            Functional::<curie::PrefixMapping, RcStr>(
+                &prefixes,
+                Context {
+                    prefixes: None,
+                    style: Style::Document,
+                    typed: false
+                },
+                None
+            )
         );
-        assert_eq!(
-            "Prefix(R:=<http://example.org/KB-CH%5BR%5D-8-5>)\n",
-            rendered
-        );
+        assert_eq!("Prefix(R:=<http://example.org/KB-CH[R]-8-5>)\n", rendered);
     }
 
     #[test]
@@ -1491,6 +2051,28 @@ mod tests {
                 Default::default(),
             );
         assert!(reparsed.is_ok(), "reparse failed: {reparsed:?}");
+
+        // So is a single-operand data intersection or union; an empty one
+        // keeps its keyword.
+        let integer =
+            DataRange::Datatype(build.datatype("http://www.w3.org/2001/XMLSchema#integer"));
+        let union = DataRange::DataUnionOf(vec![integer.clone()]);
+        assert_eq!(
+            "<http://www.w3.org/2001/XMLSchema#integer>",
+            format!("{}", union.as_functional())
+        );
+        let intersection = DataRange::DataIntersectionOf(vec![integer]);
+        assert_eq!(
+            "<http://www.w3.org/2001/XMLSchema#integer>",
+            format!("{}", intersection.as_functional())
+        );
+        assert_eq!(
+            "DataUnionOf()",
+            format!(
+                "{}",
+                DataRange::<RcStr>::DataUnionOf(vec![]).as_functional()
+            )
+        );
     }
 
     #[test]
